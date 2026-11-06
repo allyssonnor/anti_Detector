@@ -1,6 +1,6 @@
 metadata:
-  name: YAML Demo Colab - Banca Examinadora
-  role: Demonstrador rápido para Google Colab com treino em baseline e inferência cruzada
+  name: YAML Demo Colab - Banca Examinadora (Generalistas e Especialistas)
+  role: Treino dos modelos Generalistas (EF Amplo) e Especialistas (EF Bruteforce) para inferência cruzada
 settings:
   results_root: results/demo_colab
   cache_root: data/GLOBAL_CACHE_DEMO_COLAB
@@ -10,8 +10,15 @@ settings:
   run_isolated_eval: false
 
 datasets:
-- name: Synthetic_Chronological
+- name: EF_Amplo_Generalista
   overrides:
+    data.dataset_path: data/ef_amplo.jsonl
+    sampling.split_strategy: chronological
+    features.feature_set: FE-Full
+
+- name: EF_Bruteforce_Especialista
+  overrides:
+    data.dataset_path: data/ef_bruteforce.jsonl
     sampling.split_strategy: chronological
     features.feature_set: FE-Full
 

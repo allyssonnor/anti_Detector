@@ -1,6 +1,6 @@
 metadata:
-  name: YAML Demo Colab - Banca Examinadora (Generalistas e Especialistas)
-  role: Treino dos modelos Generalistas (EF Amplo) e Especialistas (EF Bruteforce) para inferência cruzada
+  name: YAML Demo Colab - Banca Examinadora (Matriz Completa Generalistas vs Especialistas)
+  role: Matriz 2x2x2x2 (EF Amplo e EF Bruteforce, Chrono e Random, Global e Per-User, RF e MLP)
 settings:
   results_root: results/demo_colab
   cache_root: data/GLOBAL_CACHE_DEMO_COLAB
@@ -10,16 +10,28 @@ settings:
   run_isolated_eval: false
 
 datasets:
-- name: EF_Amplo_Generalista
+- name: EF_Amplo_Chrono
   overrides:
     data.dataset_path: data/ef_amplo.jsonl
     sampling.split_strategy: chronological
     features.feature_set: FE-Full
 
-- name: EF_Bruteforce_Especialista
+- name: EF_Amplo_Random
+  overrides:
+    data.dataset_path: data/ef_amplo.jsonl
+    sampling.split_strategy: random
+    features.feature_set: FE-Full
+
+- name: EF_Bruteforce_Chrono
   overrides:
     data.dataset_path: data/ef_bruteforce.jsonl
     sampling.split_strategy: chronological
+    features.feature_set: FE-Full
+
+- name: EF_Bruteforce_Random
+  overrides:
+    data.dataset_path: data/ef_bruteforce.jsonl
+    sampling.split_strategy: random
     features.feature_set: FE-Full
 
 model_presets:
@@ -45,6 +57,7 @@ model_presets:
 hyperparameter_grid:
   training.threshold_mode:
   - global
+  - per_user
   model.sequence_length:
   - 20
 

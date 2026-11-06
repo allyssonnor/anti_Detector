@@ -354,6 +354,20 @@ def rodar_inferencia(config_path, dataset_novo_path, model_dir_override=None):
         plt.close()
         print(f"✅ Dashboard: {dashboard_path}")
 
+    return {
+        "dataset_evaluated": dataset_tag,
+        "model_dir": os.path.basename(output_dir),
+        "n_windows": int(len(y_test)) if has_labels else int(len(scores)),
+        "n_anomalies_true": int(np.sum(y_test)) if has_labels else 0,
+        "n_alerts": int(np.sum(y_pred)),
+        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
+        "precision": float(class_1.get("precision", float("nan"))),
+        "recall": float(class_1.get("recall", float("nan"))),
+        "f1_score": float(class_1.get("f1-score", float("nan"))),
+        "pr_auc": float(pr_auc),
+        "roc_auc": float(roc_auc),
+    }
+
 
 if __name__ == "__main__":
     import argparse

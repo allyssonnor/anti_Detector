@@ -1,0 +1,498 @@
+<USER_REQUEST>
+# Avaliação do Detector Refatorado — 01/11/2026
+
+A refatoração **entrega a arquitetura prometida** e é um avanço real sobre o baseline. A Fase 1 (infraestrutura causal) está **sólida e testada**. A Fase 2 (E0-legacy preservado) está **funcional** e tem smoke tests. Mas existem **desvios matemáticos** e **bugs de integração** que, se não corrigidos, invalidam o uso do detector na tese — porque as features **não calculam o que os nomes dizem calcular**.
+
+Vou organizar por severidade. Nada aqui exige refazer a arquitetura; tudo é corrigível incrementalmente.
+
+---
+
+## 1. O que está bem
+
+| Componente | Status |
+|---|---|
+| `LazyDecayCounter` + `LazyDecaySet` (causal, snapshot/restore, prune) | ✅ Correto e testado |
+| `FeatureState` (hash determinístico, serialize/deserialize) | ✅ Correto |
+| `FeatureSpec` + `active_specs` (ativação por colunas) | ✅ Correto |
+| `sets.py` (E0_FEATURE_NAMES, presets, normalize) | ✅ Correto |
+| `feature_processor.py` (E0 path preservado, modular path implementado) | ✅ Correto na estrutura |
+| `dataset_adapter._canonicalize` (hooks para CERT/LANL) | ⚠️ Parcial (ver §3) |
+| `trainer.py` (per-user + global + FeatureState persistido) | ✅ Estrutura correta |
+| `evaluate_performance.py` (AP, P@K, MCC, alerts/day) | ✅ Correto |
+| Testes: `test_causality`, `test_estimators`, `test_phase1_infra` | ✅ Corretos e significativos |
+| `test_protocol_safeguards` (supervisionado com 1 classe, fallback per-user) | ✅ Rigoroso |
+
+A Fase 1 é o ponto mais forte: as garantias de causalidade e determinismo estão formalmente implementadas e testadas. Isso é o que a banca vai cobrar com mais força, e está fechado.
+
+---
+
+## 2. Desvios críticos da especificação
+
+Estes são os pontos em que o código **não calcula o que o nome diz** — são os que invalidam a defesa se não forem corrigidos.
+
+### 2.1 🔴 `hawkes_z` é ajustado sobre **todos** os eventos, não sobre falhas
+
+**Arquivo:** `core/features/builders/pilar3_auth.py` + `core/features/estimators/hawkes.py`
+
+`fit_pilar3_state`:
+```python
+all_times = df_normal["Time"].to_numpy(dtype=float)
+g_mu, g_alpha = hawkes.fit_user(all_times)
+...
+for uid, group in df_normal.groupby("UserID"):
+    t_user = group["Time"].to_numpy(dtype=float)   # TODOS os eventos
+    mu_u, alpha_u = hawkes.fit_user(t_user, ...)
+```
+
+E em `build_pilar3_auth`:
+```python
+prev_t = times[max(0, i - 50):i]   # todos os eventos anteriores
+intensity = hawkes.compute_intensity(cur_t, prev_t, mu_u, alpha_u)
+```
+
+**Impacto:** `hawkes_z` está medindo “taxa não-usual de **eventos quaisquer** por usuário”, não “taxa não-usual de **falhas de autenticação**”. O nome e a intenção (auto-excitação de 4625) não correspondem ao cálculo.
+
+**Correção:**
+```python
+df_failures = df_normal[df_normal["EventID"] == 4625]
+# fit Hawkes sobre df_failures["Time"]
+
+# em build_pilar3_auth:
+# prev_t deve conter apenas tempos de 4625 anteriores
+```
+
+Sem isso, `hawkes_z` conflita com `fail_count_5m` (mesmo sinal) e perde a capacidade de detectar padrões de auto-excitação.
+
+### 2.2 🔴 `lineage_surprisal` não é Jelinek-Mercer
+
+**Arquivo:** `core/features/builders/pilar2_process.py`
+
+`fit_pilar2_state` só guarda `process_pair_counts` (parent, child) e `process_unigram_counts` (child). Não guarda triplas `(avô, pai, filho)`. E `build_pilar2_process`:
+```python
+surp_vals[i] = s                                    # Laplace em (pai, filho) ou unigrama
+lineage_vals[i] = s * (1.2 if parent in LOLBINS else 1.0)
+```
+
+Isso **não é** interpolação Jelinek-Mercer. É o mesmo surprisal multiplicado por uma constante. `JelinekMercerEstimator.estimate_weights_em` **nunca é chamado**. As triplas nunca são construídas.
+
+**Impacto:** A feature `lineage_surprisal` não mede raridade de linhagem, mede apenas raridade de par com um multiplicador ad-hoc. Isso contradiz a Seção 2.2 da especificação (que fundamenta a tripla como justificativa de detecção de `winword → cmd → powershell`).
+
+**Correção:**
+- Estender `fit_pilar2_state` para construir `triple_counts[(g, p, c)]` e manter `pair_counts[(p, c)]` e `unigram_counts[c]`.
+- Em `build_pilar2_process`, calcular `P_JM = λ3·P̂(g,p,c) + λ2·P̂(p,c) + λ1·P̂(c)` com `λ` estimados via EM (a classe já existe; só precisa ser chamada).
+- `lineage_surprisal = -log2(max(P_JM, ε))`.
+
+### 2.3 🔴 `spray_z` não calcula entropia por IP
+
+**Arquivo:** `core/features/builders/pilar3_auth.py`
+
+```python
+if "IpAddress" in df.columns and "Time" in df.columns:
+    spray_counts = legacy.time_window_count(df, "is_failed", 600.0, exclusive=False)
+    mean_s = float(spray_counts.mean())
+    std_s = float(spray_counts.std())
+    df["spray_z"] = ((spray_counts - mean_s) / std_s).clip(-3.0, 10.0)
+```
+
+Isso é **z-score da contagem de falhas por usuário**. Não tem relação com `spray_z` (entropia de usuários-alvo por IP). Nenhum cálculo de entropia, nenhuma agregação por IP, nenhuma normalização por tamanho de domínio.
+
+**Impacto:** A feature existe com o nome certo mas o cálculo é completamente diferente — e é o **mesmo sinal** que `fail_count_5m` (que já existe em E0). Duplica informação sem agregar capacidade de detecção de password spray.
+
+**Correção:**
+```python
+# por IP em janela [t-Δ, t):
+#   H_norm(i, t) = H(users | i, t) / log2(max(|U_domínio|, 2))
+#   SR(i, t) = N_4624(i, t) / (N_4624(i, t) + N_4625(i, t) + ε)
+#   spray_score = H_norm * (1 - SR) * log2(1 + N_users_distintos)
+#   spray_z = (spray_score - mu_subnet) / (sigma_subnet + ε)  # com shrinkage por subnet
+```
+
+### 2.4 🔴 `host_affinity` é `P`, não `-log2 P`
+
+**Arquivo:** `core/features/builders/pilar4_topology.py`
+
+```python
+p = (float(cnt) + alpha) / (float(tot) + (alpha * v_size))
+aff_list.append(p)
+df["host_affinity"] = aff_list
+```
+
+A especificação define `F_15 = -log2 P(h | u)`. A implementação entrega **P**, não o surprisal. Isso viola a filosofia declarada do vetor (todos os atributos contínuos medem bits de informação) e, mais grave, quebra a comparabilidade: `host_affinity` fica entre 0 e 1, enquanto `process_surprisal` fica em bits. O modelo aprende escalas inconsistentes.
+
+**Correção:**
+```python
+df["host_affinity"] = [-math.log2(max(p, 1e-6)) for p in aff_list]
+```
+
+E renomear a variável local de `p` para `p_laplace` ou similar, para evitar confusão.
+
+### 2.5 🔴 `lolbin_contextual` não é a fórmula da spec
+
+**Arquivo:** `core/features/builders/pilar2_process.py`
+
+```python
+df["lolbin_contextual"] = is_lolbin * (surp_vals / max(surp_vals.max(), 1.0))
+```
+
+Spec: `F_8 = 1{image ∈ LOLBin} · [-log2 P(image | parent)]`. Implementação: `1{lolbin} · (surprisal / max_surprisal)`. O fator `1/max_surprisal` **não está na especificação** e normaliza por um valor global do batch — o que **vaza informação do batch para cada evento** (o `max` depende do futuro e do conjunto todo).
+
+**Impacto duplo:** (i) desvio de fórmula; (ii) **leakage** — o `max(surp_vals)` depende de eventos futuros no batch.
+
+**Correção:** `df["lolbin_contextual"] = is_lolbin * surp_vals` (o surprisal já é comparável entre eventos porque vem do mesmo Laplace).
+
+### 2.6 🟡 `FSR` é razão, não fração
+
+**Arquivo:** `core/features/builders/pilar3_auth.py`
+
+```python
+return (n_fail + 1.0) / (n_succ + 1.0)
+```
+
+Spec: `FSR = N_4625 / (N_4624 + N_4625 + ε)`. Implementação: razão de falhas para sucessos com +1 em ambos.
+
+**Semântica diferente:**
+
+| Caso | Implementação | Spec |
+|---|---|---|
+| 0 falhas, 0 sucessos | 1.0 | 0.0 |
+| 3 falhas, 0 sucessos | 4.0 | 1.0 |
+| 0 falhas, 3 sucessos | 0.25 | 0.0 |
+| 3 falhas, 3 sucessos | 1.0 | 0.5 |
+
+A implementação dá valores ≥ 0.25 sempre (nunca 0), o que confunde o modelo (não distingue “nenhuma atividade” de “atividade balanceada”).
+
+**Correção:**
+```python
+def _time_window_ratio(df, failed_col, success_col, window_seconds):
+    n_fail = legacy.time_window_count(df, failed_col, window_seconds, exclusive=True)
+    n_succ = legacy.time_window_count(df, success_col, window_seconds, exclusive=True)
+    return n_fail / (n_succ + n_fail + 1e-6)
+```
+
+E renomear a documentação para “fração de falhas” ou renomear a feature para `fail_fraction_*` — o nome `fsr` remete a “ratio”, o que é ambíguo.
+
+### 2.7 🟡 `host_entropy_z` é z-scored dentro do batch, não contra treino
+
+**Arquivo:** `core/features/builders/pilar4_topology.py`
+
+```python
+mean_h = float(np.mean(entropy_vals))
+std_h = float(np.std(entropy_vals))
+df["host_entropy_z"] = ((df["host_entropy_norm"] - mean_h) / std_h).clip(-3.0, 5.0)
+```
+
+`entropy_vals` é o batch atual. Se o batch de teste tem distribuição diferente do treino, o z-score é sistematicamente deslocado — e **`host_entropy_z` não mede “anomalia contra baseline”**, mede “desvio contra o próprio batch”.
+
+**Correção:**
+- Estimar `mu_H(u)`, `sigma_H(u)` por usuário **no fit**.
+- Em transform: `z = (H_norm - mu_H[u]) / (sigma_H[u] + ε)`.
+
+Isso também alinha com `hour_z` (que faz isso corretamente via `historical_state["hour_mean"]`).
+
+---
+
+## 3. Bugs de integração
+
+### 3.1 🔴 `is_cold_start` é adicionado e descartado
+
+**Arquivo:** `core/trainer.py`
+
+`_prepare_and_scale_X`:
+```python
+if include_cold:
+    n_hist = self.user_event_counts.get(str(user_id), len(grp) if fit else 0)
+    grp["is_cold_start"] = 1.0 if n_hist < 10 else 0.0
+
+...
+if self.feature_columns is not None:
+    X_num = grp.reindex(columns=self.feature_columns, fill_value=0)
+```
+
+`self.feature_columns` vem de `valid_features` (que é `processor.final_feature_names` filtrado). E `processor.final_feature_names` **não contém `is_cold_start`** (o processor não produz). Então o `reindex` descarta a coluna recém-criada.
+
+Mesmo com `include_cold_start: true` no YAML, a feature **nunca entra no vetor**. O `test_trainer_cold_start_flag` passa porque verifica `"is_cold_start" in trainer.feature_columns` — mas `feature_columns` foi setado pelo **próprio teste** com essa coluna. Em produção, `valid_features` não a tem.
+
+**Correção (uma das duas):**
+- (a) `FeatureProcessor` produz `is_cold_start` baseado em `state.params["user_event_counts"]` (mais limpo — feature pertence ao processor, não ao Trainer); ou
+- (b) `Trainer` **adiciona `is_cold_start` a `self.feature_columns`** na primeira chamada de `_prepare_and_scale_X` quando `include_cold_start: true`, e propaga `feature_columns` atualizado para `_persist_meta`.
+
+### 3.2 🔴 `unavailable_features` contém features que estão em `final_feature_names`
+
+**Arquivo:** `core/features/feature_processor.py`
+
+```python
+active_specs = [s for s in specs if s.is_active(available_cols)]
+self.unavailable_features = [s.name for s in specs if not s.is_active(available_cols)]
+...
+df = build_pilar1_identity(df, state_params)  # produz TODAS as features do Pilar 1
+```
+
+`build_pilar1_identity` produz `session_age_scaled = 0` mesmo quando `LogonID`/`EventID` não estão disponíveis (spec marcada como `unavailable`). No final:
+```python
+self.final_feature_names = [c for c in df.columns if ...]  # inclui session_age_scaled
+```
+
+**Inconsistência documental:** `feature_metadata.pkl` reporta `session_age_scaled` como indisponível **e** `final_feature_names` a inclui. Isso viola o contrato da Seção 4 da especificação (“ativas vs. indisponíveis”).
+
+**Correção:**
+- Nos builders, guardar por **feature específica** e não por coluna auxiliar:
+  ```python
+  df["session_age_scaled"] = 0.0
+  if "EventID" in df.columns and "Time" in df.columns:
+      # cálculo real
+  ```
+  Mas depois: `if spec_name not in active_names: df = df.drop(columns=[spec_name], errors="ignore")`.
+- Ou, mais limpo: cada builder recebe `active_specs` e só produz features ativas.
+
+### 3.3 🟡 `_persist_meta` não grava `feature_state`/`param_hash` em produção
+
+**Arquivo:** `core/trainer.py` + `scripts/detectar.py`
+
+`detectar.py` chama `trainer.run(...)` (que chama `_persist_meta` com `self.feature_processor = None`), e **depois** injeta `meta_trainer['feature_processor'] = processor`. Mas não injeta `feature_state`, `feature_set`, `feature_version`, `param_hash`.
+
+**Impacto:** o `trainer_meta.pkl` produzido **não tem** os campos de reprodutibilidade prometidos (`param_hash`, `feature_version`). O `test_trainer_persist_feature_state` passa porque seta `trainer.feature_processor = fp` **antes** de chamar `_persist_meta` — em produção isso não acontece.
+
+**Correção (uma linha em `detectar.py`):**
+```python
+trainer = Trainer(config_final, model)
+trainer.feature_processor = processor      # antes de run()
+trainer.temporal_builder = temporal
+results = trainer.run(...)
+```
+
+Isso também resolve o problema de `feature_state` não ser gravado.
+
+### 3.4 🟡 `is_new_user_on_host` no batch usa TTL contra tempo de treino
+
+**Arquivo:** `core/features/builders/pilar4_topology.py`
+
+`contains_at(key, t_test)` retorna `True` se `key` foi vista em treino **com `t_train <= t_test` e `t_test - t_train <= 30 dias`**. Ou seja: um par `(u, h)` visto em treino fica “conhecido” apenas por 30 dias **contados do treino**. Se o teste for 31 dias após o treino, o par vira “novo” — mesmo que o usuário tenha visitado o host em todos os eventos de teste.
+
+Isso é semanticamente “visto nos últimos 30 dias **no treino**”, não “visto nos últimos 30 dias em qualquer momento”.
+
+**Correção:** em modo congelado (batch), usar `t_test` apenas para garantir ordem causal (`t_train <= t_test`), sem aplicar TTL — semântica “alguma vez visto no treino”. Ou documentar explicitamente que o batch usa TTL-training-based.
+
+### 3.5 🟡 `first_event_after_dormant` marca o primeiro evento do usuário como dormente
+
+**Arquivo:** `core/features/builders/pilar5_temporal.py`
+
+```python
+diffs = np.diff(np.concatenate([[sub_times[0] - 86400.0], sub_times]))
+```
+
+Para o primeiro evento do usuário, `diffs[0] = 86400` (> 12h) → `first_event_after_dormant = 1`. O primeiro evento de uma entidade **não tem estado anterior** — não pode ser “após dormência”. Deveria ser 0 (ou flag `first_ever` separada).
+
+**Correção:**
+```python
+diffs = np.diff(sub_times)
+is_dormant = np.zeros(len(sub_times), dtype=float)
+if len(sub_times) > 1:
+    is_dormant[1:] = (diffs > 43200.0).astype(float)
+```
+
+### 3.6 🟡 `dormant_surprisal` é log1p, não histograma 2D com decaimento
+
+**Arquivo:** `core/features/builders/pilar5_temporal.py`
+
+```python
+df.loc[idx, "dormant_surprisal"] = np.log1p(np.maximum(diffs / 3600.0, 0.0)) * is_dormant
+```
+
+Spec: `-log2 f̂(Δt, hour | u)` com histograma 2D e decaimento. Implementação: `log1p(Δh) · 1{dormant}`. Não é surprisal, é uma transformação monótona.
+
+**Impacto:** o nome diz “surprisal” mas não mede bits de informação — é uma escala arbitrária. Comparável apenas internamente; não comparável com `hour_z` ou `temporal_surprisal`.
+
+**Correção:** implementar histograma 2D (`dormant_bin = log(Δh)`, `hour_bin = int(hour)`) com decaimento exponencial no fit, e calcular `-log2(f̂)` em transform.
+
+### 3.7 🟡 Pillar 6 tem features declaradas mas com valor fixo 0
+
+**Arquivo:** `core/features/builders/pilar6_forensic.py`
+
+```python
+df["userassist_decoded_exec"] = 0.0
+df["registry_key_rarity"] = 0.0
+df["new_registry_key_on_host"] = 0.0
+df["registry_value_entropy"] = 0.0
+df["registry_value_len"] = 0.0
+df["module_load_rarity"] = 0.0
+df["module_first_seen_on_host"] = 0.0
+```
+
+**Impacto:** 7 de 13 features de Pilar 6 são **placeholders**. `is_sensitive_key`, `module_from_user_writable`, `module_unsigned_or_unknown` estão implementadas. As demais não.
+
+Isso não é um bug — é escopo incompleto. Mas como são declaradas na spec e entram em `final_feature_names` como zeros constantes, elas inflam a dimensionalidade sem agregar informação. Isso **viola a diretriz §6.1 do protocolo experimental** (“não implementar todas as features sem validação — features constantes pioram o modelo”).
+
+**Correção (curto prazo):** marcar como `unavailable` até serem implementadas, e não incluir no vetor. Ou implementar:
+- `userassist_decoded_exec`: `codecs.decode(value_name, 'rot_13')` quando `RegistryPath` contém `UserAssist\...\Count`.
+- `registry_key_rarity`: JM + Laplace sobre `(host, key)` no fit.
+- `registry_value_entropy` / `registry_value_len`: sobre `registry_value` binário.
+- `module_load_rarity`: JM + Laplace sobre `(process, module)`.
+- `module_first_seen_on_host`: `LazyDecaySet` análogo a `is_new_user_on_host`.
+
+### 3.8 🟡 `decode_userassist` retorna contagem, não executável
+
+**Arquivo:** `core/features/builders/pilar6_forensic.py`
+
+```python
+def decode_userassist(val_name: str, val_bytes: bytes) -> int:
+    decoded_name = codecs.decode(val_name, "rot_13")
+    if val_bytes and len(val_bytes) >= 8:
+        count = int.from_bytes(val_bytes[4:8], "little")
+        return count
+    return 0
+```
+
+A função **calcula** `decoded_name` mas o descarta e retorna apenas a contagem. E o teste `test_pilar6_cmd_regex_and_userassist` verifica `assert exec_count == 42` (a contagem). Ou seja, a função funciona como “contador de execuções”, **não** como “executável decodificado”.
+
+A feature `userassist_decoded_exec` está hardcoded a 0 — ou seja, mesmo a função não é usada para ela.
+
+**Correção:** a função deve retornar `(decoded_executable, exec_count)` e ser usada em `build_pilar6_forensic` para produzir a feature. Caso contrário, o nome da feature é enganoso.
+
+### 3.9 🟡 `_canonicalize` no CERT usa `contains("logon")` que casa com “Logon_Failed”
+
+**Arquivo:** `core/data/dataset_adapter.py`
+
+```python
+df["is_success"] = act_str.str.contains("logon").astype(int)
+df["is_failed"] = act_str.str.contains("fail").astype(int)
+```
+
+Se o CERT tiver `activity = "Logon_Failed"`, ambas as flags ficam 1 — a mesma linha é sucesso **e** falha. O teste usa “Logoff_Failed” (que não casa com “logon”), então não detecta o problema.
+
+**Correção:** usar padrões mais específicos:
+```python
+df["is_success"] = act_str.str.match(r"^logon(_success)?$").astype(int)
+df["is_failed"] = act_str.str.contains(r"fail|denied|error").astype(int)
+```
+
+### 3.10 🟡 Canonicalização CERT/LANL incompleta
+
+O audit document (Fase 0) previa aliases para `LogonType`, `AuthenticationPackageName`, `IpAddress`. A implementação cobre:
+- ✅ `activity`/`auth` → `is_success`/`is_failed`
+- ✅ `SourceIP` → `IpAddress`
+- ❌ `LogonType` (LANL tem `Interativo`/`Rede`; não mapeado)
+- ❌ `AuthenticationPackageName` (LANL tem `Kerberos`/`NTLM`; não mapeado)
+
+**Impacto:** em LANL, `is_new_logontype_for_user` (Pilar 4) fica ausente mesmo havendo a coluna bruta. E `is_ntlm` (E0+) fica ausente.
+
+**Correção em `_canonicalize`:**
+```python
+if "interativo" in cols_lower or "rede" in cols_lower:
+    # LANL: converter em LogonType numérico
+    logon_col = ...  # escolher coluna
+    lt_map = {"interativo": 2, "rede": 3, "rdp": 10}
+    df["LogonType"] = df[logon_col].astype(str).str.lower().map(lt_map).fillna(0).astype(int)
+
+if "kerberos" in cols_lower or "ntlm" in cols_lower:
+    # LANL: a coluna de pacote é um one-hot; sintetizar AuthenticationPackageName
+    ...
+```
+
+Sem isso, o promise de “ativo plenamente em CERT/LANL” (Fase 0 §5) não é cumprido para Pilar 4.
+
+### 3.11 🟡 `feature_processor.fit` executa `fit_pilar3_state` mesmo em `FE-Core`
+
+`FE-Core` exclui `hawkes_z` do vetor, mas `fit_pilar3_state` ainda roda (custoso: `minimize` por usuário). Não é bug, mas é ineficiência de ~40% do tempo de fit em `FE-Core` para features não usadas.
+
+**Correção:** `fit()` filtra `specs = get_specs_for_preset(self.feature_set)` antes de rodar os `fit_pilarN_state`, e só chama os `fit_*` para pilares cujas specs estão ativas.
+
+---
+
+## 4. Desvios menores
+
+### 4.1 `session_age_scaled` requer EventID mas spec declara apenas Time/UserID
+
+`FeatureSpec("session_age_scaled", 1, ("Time", "UserID"), ("LogonID", "EventID"), ...)`. Mas em `build_pilar1_identity`, o cálculo só ocorre `if "EventID" in df.columns`. Sem EventID, o valor é 0. Semântica “degradada” não documentada.
+
+**Correção:** mover EventID para `required`, ou declarar `degraded_mode = "0"` explicitamente.
+
+### 4.2 `FeatureSpec.half_life=3600` para `hawkes_z` mas a implementação usa `tau=300`
+
+Metadado inconsistente. O `half_life` de `hawkes_z` na spec não corresponde ao `tau=300.0` hardcoded em `fit_pilar3_state`. Documentar que `half_life` de Hawkes é o `tau` do kernel (`τ=300s`), ou corrigir o valor na spec para 300.
+
+### 4.3 `alerts_per_day` assume `Time` em segundos
+
+```python
+span_sec = float(test_df["Time"].max() - test_df["Time"].min())
+time_span_days = max(span_sec / 86400.0, 1.0 / 24.0)
+```
+
+Se `Time` estiver em ms (dataset malformado), `alerts_per_day` fica 1000× errado. Já era assim antes; mencionar na tese como premissa.
+
+### 4.4 `test_e0_golden` não é golden de fato
+
+```python
+essential_features = ["fail_rate", "fail_count_5m", ...]
+for feat in essential_features:
+    assert feat in final_cols
+```
+
+Verifica **presença**, não **valores**. Um teste golden real precisa comparar contra uma referência de valores conhecidos (fixos, não recalculados). Como não há referência, não há prova de paridade bit-a-bit.
+
+**Correção:** salvar um `data/golden_e0_expected.parquet` (gerado uma vez com o código antigo) e comparar `pd.testing.assert_frame_equal` no CI. Sem isso, um regression silencioso (ex.: `fail_count_5m` mudar de `[t-Δ, t)` para `[t-Δ, t]`) passa despercebido.
+
+### 4.5 `test_e0_golden` é `skip` sem `data/seed_1.jsonl`
+
+Em CI sem o dataset, o teste inteiro é pulado. O “golden” então não existe em CI — não há verificação contínua.
+
+**Correção:** fixture sintética determinística (não depender de `data/seed_1.jsonl`). Ex.: gerar 400 eventos com seed fixa e comparar contra snapshot versionado.
+
+### 4.6 `_build_benign_training_sequences` não passa `feature_columns` para `_build_sequences`
+
+```python
+X_all, indices, users, labels = self._build_sequences(
+    train_df, fit=False, return_labels=True
+    # feature_columns não é passado
+)
+```
+
+Mas `_prepare_and_scale_X` dentro de `_build_sequences` chama `self._prepare_and_scale_X(group, user_id, fit=False, feature_columns=None)`, que usa `self.feature_columns` (já setado na fase anterior). Isso funciona, mas por acaso. Não é bug, é fragilidade: se `self.feature_columns` não tiver sido setado (ex.: nenhum `_prepare_and_scale_X(fit=True)` rodou porque `benign_events` é vazio), falha silenciosamente.
+
+**Correção:** passar `feature_columns=feature_columns` explicitamente, como no branch `is_supervised`.
+
+### 4.7 `_rolling_rate` inclui o evento atual — declarado, mas pode confundir
+
+`rolling_rate` na spec é descrita como “estado em `t`”, mas o nome sugere taxa histórica. Recomendação textual: renomear para `_rolling_rate_at_t` ou documentar no docstring (já está) e **incluir a distinção na tese** (Seção 3.1 do documento consolidado).
+
+### 4.8 `fit_pilar4_state` usa `iterrows` para popular LazyDecaySet
+
+Performance: O(N) com overhead Python em vez de vetorizado. Em dataset grande (1M+ eventos), adiciona minutos. Não é bug, é performance. Mitigável com `zip(df["UserID"], df["LogHost"], df["Time"])` (que o próprio `build_pilar4_topology` usa).
+
+### 4.9 `_validate_dataframe` não valida UserID
+
+`detectar.py`:
+```python
+if 'Time' not in df.columns:
+    return False
+```
+
+Não valida UserID. Se o dataset não tiver UserID (e `_normalize` não criar), os builders que fazem `df["UserID"]` quebram com `KeyError` em vez de cair no `degraded_mode`.
+
+**Correção:** validar `UserID` explicitamente, ou garantir em `_normalize` que `UserID` sempre existe (criar `"unknown"` se necessário).
+
+---
+
+## 5. Priorização para correção
+
+### P0 — bloqueiam a defesa
+
+1. **2.1** Hawkes sobre falhas (não todos eventos).
+2. **2.2** JM de fato para `lineage_surprisal`.
+3. **2.3** `spray_z` = entropia por IP.
+4. **2.4** `host_affinity = -log2 P`.
+5. **3.1** `is_cold_start` integrado ao vetor.
+6. **3.2** `unavailable_features` consistente com `final_feature_names`.
+
+### P1 — afetam resultados
+
+7. **2.5** `lolbin_contextual` sem normalização por `max`.
+8. **2.6** `FSR` = fração (não razão).
+9. **2.7** `host_entropy_z` contra treino.
+10. **3.3** `feature_state`/`param
+
+Eis a avaliação do código.
+Antes de corrigir, se possível, pode estruturar um prompt de automação, para que o agente teste o código e busque aprimorá-lo (principalmente a engenharia de atributos) de modo a chegar em pelo menos em 60% e precisão Precision $\ge 0,30$ ou $\ge 0,50$?
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-11-01T17:05:38-03:00.
+</ADDITIONAL_METADATA>

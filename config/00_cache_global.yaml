@@ -1,0 +1,124 @@
+metadata:
+  name: YAML 00 - Cache EDA e treinos 02/04
+  role: reconstrução de caches compatíveis com EDA e treinos principais
+  note: Gera caches de features para as variantes full e sem LogonType, com as mesmas
+    chaves de dataset, seed e estratégia dos YAMLs 02 e 04. O modelo dummy só valida
+    o fluxo e seus resultados não devem ser usados na tese.
+settings:
+  results_root: results/00_cache_global
+  cache_root: data/GLOBAL_CACHE_DETECTOR_earlystop_v3
+  seeds:
+  - 42
+  - 123
+  - 999
+  - 1001
+  - 1002
+  - 1003
+  - 1004
+  - 1005
+  - 1006
+  - 1007
+  save_checkpoints: false
+  run_mixed_eval: false
+  run_isolated_eval: false
+datasets:
+- name: Synthetic_Chronological
+  overrides:
+    sampling.split_strategy: chronological
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+- name: Synthetic_Random
+  overrides:
+    sampling.split_strategy: random
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+- name: Synthetic_Chronological_WithoutLogonType
+  overrides:
+    sampling.split_strategy: chronological
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+    features.exclude_features: &without_logon_type
+    - LogonType
+    - network_logon
+    - network_logon_rate
+    - rdp_event
+    - rdp_rate
+- name: Synthetic_Random_WithoutLogonType
+  overrides:
+    sampling.split_strategy: random
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+    features.exclude_features: *without_logon_type
+model_presets:
+- name: CACHE_DUMMY
+  overrides:
+    model.type: mlp_single
+    training.supervised: false
+    model.mlp_single:
+      hidden_layer_sizes:
+      - 1
+      max_iter: 1
+      early_stopping: false
+hyperparameter_grid:
+  model.sequence_length:
+  - 20
+  training.threshold_mode:
+  - global
+data:
+  dataset_path: data/seed_1.jsonl
+  target_col: Is_Anomaly
+  time_nan_strategy: nan
+sampling:
+  mode: full
+  split_ratios:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+  split_strategy: chronological
+training:
+  resume: false
+  save_model: false
+  supervised: false
+temporal:
+  session_timeout: 1800
+  min_events_session: 2
+features:
+  enabled: true
+  enabled_groups:
+  - auth_failure
+  - volume_anomaly
+  - temporal_anomaly
+  - lateral_movement
+  - rdp_anomaly
+  - golden_ticket
+  - process_anomaly
+  - privilege_anomaly
+output_dir: results/00_cache_global/full

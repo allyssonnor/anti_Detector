@@ -1,0 +1,68 @@
+metadata:
+  name: YAML 101 - Treino EF Amplo (RF e MLP com FE-Full e E0-Legacy)
+  role: treino dos modelos refatorados (RandomForest e MLP) sobre o dataset ef_amplo.jsonl
+settings:
+  results_root: results/101_ef_treino_amplo
+  cache_root: data/GLOBAL_CACHE_101_EF_AMPLO
+  seeds: [42]
+  save_checkpoints: true
+  run_mixed_eval: true
+  run_isolated_eval: false
+datasets:
+- name: Synthetic_FE_Full
+  overrides:
+    sampling.split_strategy: chronological
+    features.feature_set: FE-Full
+- name: Synthetic_E0_Legacy
+  overrides:
+    sampling.split_strategy: chronological
+    features.feature_set: E0-legacy
+model_presets:
+- name: RandomForest
+  overrides:
+    model.type: random_forest_supervised
+    training.supervised: true
+    model.random_forest_supervised:
+      n_estimators: 150
+      max_depth: 8
+      class_weight: balanced_subsample
+      n_jobs: 1
+- name: MLP_Single
+  overrides:
+    model.type: mlp_single
+    training.supervised: false
+    model.mlp_single:
+      hidden_layer_sizes:
+      - 64
+      - 32
+      max_iter: 100
+      early_stopping: true
+      validation_fraction: 0.1
+hyperparameter_grid:
+  training.threshold_mode:
+  - global
+  - per_user
+  model.sequence_length:
+  - 20
+data:
+  dataset_path: data/ef_amplo.jsonl
+  target_col: Is_Anomaly
+  time_nan_strategy: nan
+sampling:
+  mode: full
+  split_strategy: chronological
+  split_ratios:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+training:
+  resume: false
+  save_model: true
+  optimization_metric: f2
+  threshold_search:
+    percentile_min: 75.0
+    percentile_max: 99.5
+    percentile_step: 0.5
+temporal:
+  session_timeout: 1800
+  min_events_session: 2

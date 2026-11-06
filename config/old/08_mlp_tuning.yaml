@@ -1,0 +1,82 @@
+metadata:
+  name: YAML 08 - Tunagem MLP Autoencoder
+  role: refinamento da arquitetura MLP
+settings:
+  results_root: results/08_mlp_tuning
+  cache_root: data/GLOBAL_CACHE_DETECTOR
+  seeds:
+  - 42
+  save_checkpoints: true
+  run_mixed_eval: true
+  run_isolated_eval: false
+datasets:
+- name: Synthetic_Chronological
+  overrides:
+    sampling.split_strategy: chronological
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+- name: Synthetic_Random
+  overrides:
+    sampling.split_strategy: random
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+model_presets:
+- name: MLP_Tuned
+  overrides:
+    model.type: mlp_single
+    training.supervised: false
+    model.mlp_single:
+      activation: relu
+      solver: adam
+      alpha: 0.0001
+      batch_size: 256
+      learning_rate_init: 0.001
+hyperparameter_grid:
+  training.threshold_mode:
+  - global
+  model.sequence_length:
+  - 20
+  model.mlp_single.hidden_layer_sizes:
+  - - 32
+    - 16
+  - - 64
+    - 32
+  - - 128
+    - 64
+  - - 256
+    - 128
+    - 64
+  model.mlp_single.max_iter:
+  - 50
+  - 100
+  - 200
+data:
+  dataset_path: /data/seed_1.jsonl
+  target_col: Is_Anomaly
+  time_nan_strategy: nan
+sampling:
+  mode: full
+  split_ratios:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+training:
+  resume: false
+  save_model: true
+temporal:
+  session_timeout: 1800
+  min_events_session: 2

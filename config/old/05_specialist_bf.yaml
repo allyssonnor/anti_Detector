@@ -1,0 +1,83 @@
+metadata:
+  name: YAML 05 - Especialista Bruteforce
+  role: treinar modelos no dominio especifico de bruteforce; a comparacao direta com
+    o generalista sera feita no experimento final de inferencia
+settings:
+  results_root: results/05_specialist_bf
+  cache_root: data/GLOBAL_CACHE_DETECTOR
+  seeds:
+  - 42
+  - 123
+  - 999
+  save_checkpoints: true
+  run_mixed_eval: true
+  run_isolated_eval: false
+
+datasets:
+- name: Synthetic_Chronological_BF
+  overrides:
+    sampling.split_strategy: chronological
+    data.dataset_path: data/test_bruteforce_42.jsonl
+    features.enabled_groups: &id001
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+- name: Synthetic_Random_BF
+  overrides:
+    sampling.split_strategy: random
+    data.dataset_path: data/test_bruteforce_42.jsonl
+    features.enabled_groups: *id001
+
+model_presets:
+- name: RandomForest
+  overrides:
+    model.type: random_forest_supervised
+    training.supervised: true
+    model.random_forest_supervised:
+      n_estimators: 200                     # <-- tunado (YAML 07)
+      max_depth: 10                         # <-- tunado (YAML 07)
+      class_weight: balanced_subsample
+
+- name: MLP_Single
+  overrides:
+    model.type: mlp_single
+    training.supervised: false
+    model.mlp_single:
+      hidden_layer_sizes:                   # <-- tunado (YAML 08)
+      - 256
+      - 128
+      - 64
+      max_iter: 100
+
+hyperparameter_grid:
+  training.threshold_mode:
+  - global
+  - per_user
+  model.sequence_length:
+  - 1
+  - 20
+
+data:
+  dataset_path: data/test_bruteforce_42.jsonl
+  target_col: Is_Anomaly
+  time_nan_strategy: nan
+
+sampling:
+  mode: full
+  split_ratios:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+
+training:
+  resume: true
+  save_model: true
+
+temporal:
+  session_timeout: 1800
+  min_events_session: 2

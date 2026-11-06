@@ -1,0 +1,81 @@
+metadata:
+  name: YAML 09 - Experimento Final do Melhor Autoencoder
+  status: TEMPLATE_APOS_ESCOLHA_DO_MELHOR_MODELO
+  role: treinar o melhor autoencoder apenas em normal/prevalencia zero e inferir em
+    dataset misto e ataques isolados
+  instruction: Preencher best_model com o modelo vencedor de 01/03/08 e apontar os
+    datasets de inferencia. O executor atual super_detectar.py nao faz inferencia
+    cruzada/isolada automaticamente; este YAML e o contrato do experimento final.
+settings:
+  results_root: results/09_best_autoencoder
+  cache_root: data/GLOBAL_CACHE_DETECTOR
+  seeds:
+  - 42
+  save_checkpoints: true
+  run_mixed_eval: true
+  run_isolated_eval: true
+  isolated_targets:
+  - test_bruteforce
+  - test_lateral_movement
+  - test_rdp
+best_model:
+  name: SUBSTITUIR_PELO_VENCEDOR
+  source_run: SUBSTITUIR_PELO_RUN_DO_MELHOR_MODELO
+  model_type: mlp_single
+  sequence_length: 20
+  training:
+    supervised: false
+    normal_only: true
+datasets:
+- name: Normal_Train
+  role: treino_normal
+  overrides:
+    sampling.split_strategy: chronological
+    data.dataset_path: /content/drive/MyDrive/Dados_Detecção/dados de treino/dataset
+      misto/seed_1/seed_1.jsonl
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+inference_targets:
+  mixed_dataset: /content/drive/MyDrive/Dados_Detecção/dados de treino/dataset misto/seed_1/seed_1.jsonl
+  isolated_datasets:
+    test_bruteforce: /content/drive/MyDrive/Dados_Detecção/dados de treino/datasets
+      individuais/test_bruteforce_42/test_bruteforce_42.jsonl
+model_presets:
+- name: BEST_AUTOENCODER
+  overrides:
+    model.type: mlp_single
+    training.supervised: false
+    model.mlp_single:
+      hidden_layer_sizes:
+      - 64
+      - 32
+      max_iter: 100
+hyperparameter_grid:
+  training.threshold_mode:
+  - per_user
+  model.sequence_length:
+  - 20
+data:
+  dataset_path: /content/drive/MyDrive/Dados_Detecção/dados de treino/dataset misto/seed_1/seed_1.jsonl
+  target_col: Is_Anomaly
+  time_nan_strategy: nan
+sampling:
+  mode: full
+  split_ratios:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+training:
+  resume: false
+  save_model: true
+  supervised: false
+temporal:
+  session_timeout: 1800
+  min_events_session: 2

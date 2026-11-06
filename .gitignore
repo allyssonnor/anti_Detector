@@ -1,0 +1,39 @@
+# Ambientes virtuais
+.venv/
+.venv*/
+env/
+venv/
+ENV/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testes & Cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Dados pesados e Caches de Execução
+data/
+results/
+output/
+voltar para results depois/
+*.jsonl
+*.parquet
+*.h5
+*.pkl
+*.npy
+
+# Logs
+*.log
+_logs/
+
+# IDEs e Sistema
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

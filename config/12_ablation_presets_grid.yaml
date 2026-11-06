@@ -1,0 +1,67 @@
+metadata:
+  name: YAML 12 - Grade de Ablação dos Presets de Features (E0 a E9)
+  role: Avaliação comparativa de ganho incremental por pilar e baseline legado
+
+settings:
+  results_root: results/12_ablation_presets
+  cache_root: data/GLOBAL_CACHE_ABLATION
+  seeds: [42]
+  save_checkpoints: true
+  run_mixed_eval: true
+  run_isolated_eval: false
+
+datasets:
+  - name: Synthetic_E0_Legacy
+    overrides:
+      sampling.split_strategy: chronological
+      features.feature_set: E0-legacy
+
+  - name: Synthetic_FE_Core
+    overrides:
+      sampling.split_strategy: chronological
+      features.feature_set: FE-Core
+
+  - name: Synthetic_FE_Full
+    overrides:
+      sampling.split_strategy: chronological
+      features.feature_set: FE-Full
+
+model_presets:
+  - name: MLP_Single
+    overrides:
+      model.type: mlp_single
+      training.supervised: false
+      model.mlp_single:
+        hidden_layer_sizes: [64, 32]
+        max_iter: 20
+
+hyperparameter_grid:
+  training.threshold_mode: [per_user]
+  model.sequence_length: [10]
+
+data:
+  dataset_path: data/seed_1.jsonl
+  target_col: Is_Anomaly
+  time_nan_strategy: nan
+
+sampling:
+  mode: debug
+  train_size: 2000
+  split_ratios:
+    train: 0.6
+    val: 0.2
+    test: 0.2
+
+training:
+  resume: false
+  save_model: true
+  supervised: false
+  optimization_metric: f2
+  threshold_search:
+    percentile_min: 75.0
+    percentile_max: 99.5
+    percentile_step: 0.5
+
+temporal:
+  session_timeout: 1800
+  min_events_session: 2

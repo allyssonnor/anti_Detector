@@ -1,0 +1,118 @@
+metadata:
+  name: YAML 01 - Baseline_GPU
+  role: comparacao de modelos profundos e classicos nao supervisionados
+settings:
+  results_root: results/01_baseline_GPU
+  cache_root: data/GLOBAL_CACHE_DETECTOR
+  seeds: [42]
+  save_checkpoints: true
+  run_mixed_eval: true
+  run_isolated_eval: false
+
+datasets:
+- name: Synthetic_Chronological
+  overrides:
+    sampling.split_strategy: chronological
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+- name: Synthetic_Random
+  overrides:
+    sampling.split_strategy: random
+    features.enabled_groups:
+    - auth_failure
+    - volume_anomaly
+    - temporal_anomaly
+    - lateral_movement
+    - rdp_anomaly
+    - golden_ticket
+    - process_anomaly
+    - privilege_anomaly
+
+model_presets:
+# ------------------------------------------------------------
+# Isolation Forest (baseline classico, CPU)
+# ------------------------------------------------------------
+#- name: "IsolationForest"
+#  overrides:
+#    model.type: "isolation_forest"
+#    training.supervised: false
+#    model.isolation_forest:
+#      n_estimators: 200
+#      contamination: auto
+# ------------------------------------------------------------
+# MLP Autoencoder (GPU)
+# ------------------------------------------------------------
+#- name: "MLP_Autoencoder_Tiny"
+#  overrides:
+#    model.type: "mlp_autoencoder"
+#    model.mlp_autoencoder.dense_units: [32, 16]
+#    model.mlp_autoencoder.latent_dim: 4
+#    training.batch_size: 64
+#    training.epochs: 50
+# ------------------------------------------------------------
+# MLP Autoencoder (GPU, maior)
+# ------------------------------------------------------------
+#- name: "MLP_Autoencoder_Large"
+#  overrides:
+#    model.type: "mlp_autoencoder"
+#    model.mlp_autoencoder.dense_units: [64, 32]
+#    model.mlp_autoencoder.latent_dim: 8
+#    training.batch_size: 64
+#    training.epochs: 50
+# ------------------------------------------------------------
+# LSTM Autoencoder (GPU)
+# ------------------------------------------------------------
+- name: "LSTM_Tiny"
+  overrides:
+    model.type: "lstm_autoencoder"
+    model.lstm_autoencoder.lstm_units: [32, 16]
+    model.lstm_autoencoder.latent_dim: 4
+    training.batch_size: 64
+    training.epochs: 30
+# ------------------------------------------------------------
+# Ensemble (MLP + LSTM + IF)
+# ------------------------------------------------------------
+#- name: "Ensemble_Tiny"
+#  overrides:
+#    model.type: "ensemble"
+#    model.ensemble.models: ["mlp_autoencoder", "lstm_autoencoder", "isolation_forest"]
+#    model.ensemble.weights: [0.3, 0.4, 0.3]
+#    model.mlp_autoencoder.dense_units: [32, 16]
+#    model.mlp_autoencoder.latent_dim: 4
+#    model.lstm_autoencoder.lstm_units: [32, 16]
+#    model.lstm_autoencoder.latent_dim: 4
+#    training.batch_size: 64
+#    training.epochs: 30
+
+hyperparameter_grid:
+  training.threshold_mode:
+  - global
+  model.sequence_length:
+  - 20
+
+data:
+  dataset_path: /data/seed_1.jsonl
+  target_col: Is_Anomaly
+  time_nan_strategy: nan
+
+sampling:
+  mode: full
+  split_ratios:
+    train: 0.7
+    val: 0.2
+    test: 0.1
+
+training:
+  resume: true
+  save_model: true
+
+temporal:
+  session_timeout: 1800
+  min_events_session: 2

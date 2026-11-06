@@ -1,0 +1,3381 @@
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/trainer.py
+================================================================================
+# core/trainer.py
+
+import os
+import json
+import pickle
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from numpy.lib.stride_tricks import sliding_window_view
+
+try:
+    from sklearn.ensemble import IsolationForest
+    HAS_IFOREST = True
+except ImportError:
+    HAS_IFOREST = False
+
+
+TRAINING_PROTOCOL_VERSION = "train_val_independent_v4_features_v2"
+
+
+class Trainer:
+    def _checkpoint_uses_current_protocol(self, meta_path):
+        try:
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+            return meta.get("training_protocol") == TRAINING_PROTOCOL_VERSION
+        except Exception:
+            return False
+
+    def __init__(self, config, model):
+        self.config = config
+        self.model = model
+        self.sequence_length = config.get("model", {}).get("sequence_length", 10)
+        self.scalers = {}
+        self.feature_columns = None
+        self.output_dir = config.get("output_dir", "./output")
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Opcionais: se anexados antes de run(), são persistidos no meta.
+        # O detectar.py atual injeta post-hoc; esta é a safety net.
+        self.feature_processor = None
+        self.temporal_builder = None
+
+        self.user_thresholds = {}
+        self.global_threshold = 0.0
+
+    @staticmethod
+    def _select_training_events(train_df, target="Is_Anomaly"):
+        if target not in train_df.columns:
+            return train_df.copy()
+        return train_df.loc[train_df[target] == 0].copy()
+
+    def _build_benign_training_sequences(self, train_df, feature_columns=None):
+        target = self.config.get("data", {}).get("target_col", "Is_Anomaly")
+        benign_events = self._select_training_events(train_df, target=target)
+
+        # 1. Scaler per-user (comportamento anterior)
+        for user_id, group in benign_events.groupby("UserID", sort=False):
+            self._prepare_and_scale_X(
+                group, user_id, fit=True, feature_columns=feature_columns
+            )
+
+        # 2. Scaler global fallback (cold-start) — fitado APENAS sobre benignos
+        if self.feature_columns is not None and len(benign_events) > 1:
+            try:
+                X_global = benign_events.reindex(
+                    columns=self.feature_columns, fill_value=0
+                ).values.astype(np.float32)
+                if X_global.shape[0] > 1:
+                    global_scaler = StandardScaler()
+                    global_scaler.fit(X_global)
+                    self.scalers["__GLOBAL__"] = global_scaler
+            except Exception as e:
+                print(f"⚠️ Global scaler fallback não criado: {e}")
+
+        X_all, indices, users, labels = self._build_sequences(
+            train_df, fit=False, return_labels=True
+        )
+        if labels is not None:
+            benign_windows = labels == 0
+            X_all = X_all[benign_windows]
+            indices = indices[benign_windows]
+            users = users[benign_windows]
+        return X_all, indices, users, labels
+
+    def _compute_f2_score(self, y_true, y_pred):
+        if y_true is None or len(y_true) == 0:
+            return 0.0
+        tp = np.sum((y_pred == 1) & (y_true == 1))
+        fp = np.sum((y_pred == 1) & (y_true == 0))
+        fn = np.sum((y_pred == 0) & (y_true == 1))
+
+        if tp == 0:
+            return 0.0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+        if precision == 0 or recall == 0:
+            return 0.0
+        beta = 2.0
+        return (1 + beta**2) * (precision * recall) / ((beta**2 * precision) + recall)
+
+    def _personalized_thresholds(self, scores, users, labels, percentile, min_windows=5):
+        if labels is None:
+            return {}
+        scores = np.asarray(scores)
+        users = np.asarray(users)
+        labels = np.asarray(labels)
+        thresholds = {}
+        for uid in np.unique(users):
+            user_mask = users == uid
+            if np.sum(user_mask) >= min_windows and np.any(labels[user_mask] == 1):
+                thresholds[str(uid)] = float(np.percentile(scores[user_mask], percentile))
+        return thresholds
+
+    def _prepare_and_scale_X(self, group, user_id, fit=False, feature_columns=None):
+        if fit and feature_columns is not None:
+            self.feature_columns = feature_columns
+
+        if self.feature_columns is not None:
+            X_num = group.reindex(columns=self.feature_columns, fill_value=0)
+        else:
+            target = self.config.get("data", {}).get("target_col", "Is_Anomaly")
+            drop_cols = ["UserID", "Time", target, "EventID", "datetime", "session_id", "AnomalyType"]
+            X_num = group.drop(columns=[c for c in drop_cols if c in group.columns]).select_dtypes(include=[np.number])
+            if fit:
+                self.feature_columns = X_num.columns.tolist()
+
+        X_arr = X_num.values.astype(np.float32)
+        if X_arr.shape[0] == 0:
+            return X_arr
+
+        if fit:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_arr)
+            self.scalers[str(user_id)] = scaler
+        else:
+            # Fallback: usuário → global → identidade (último caso)
+            scaler = self.scalers.get(str(user_id)) or self.scalers.get("__GLOBAL__")
+            X_scaled = scaler.transform(X_arr) if scaler else X_arr
+
+        return X_scaled
+
+    def _build_sequences(self, df, fit=False, return_labels=False, feature_columns=None):
+        X_all, indices_all, users_all, labels_all = [], [], [], []
+        target = self.config.get("data", {}).get("target_col", "Is_Anomaly")
+
+        grouping = self.config.get("model", {}).get("window_grouping", "user")
+        if grouping == "session" and "session_id" in df.columns:
+            iterator = df.groupby(["UserID", "session_id"], sort=False)
+        else:
+            iterator = df.groupby("UserID", sort=False)
+
+        for key, group in iterator:
+            user_id = key[0] if isinstance(key, tuple) else key
+
+            X = self._prepare_and_scale_X(group, user_id, fit=fit, feature_columns=feature_columns)
+            if len(X) < self.sequence_length:
+                continue
+
+            windows = sliding_window_view(X, window_shape=self.sequence_length, axis=0)
+            windows = np.swapaxes(windows, 1, 2)
+            X_all.append(windows)
+
+            idx = group.index.values[self.sequence_length - 1:]
+            indices_all.append(idx)
+            users_all.append(np.full(len(idx), str(user_id)))
+
+            if return_labels and target in df.columns:
+                windows_labels = sliding_window_view(group[target].values, window_shape=self.sequence_length)
+                labels_all.append(np.max(windows_labels, axis=1))
+
+        if not X_all:
+            return np.array([]), np.array([]), np.array([]), None
+
+        return (
+            np.concatenate(X_all),
+            np.concatenate(indices_all),
+            np.concatenate(users_all),
+            np.concatenate(labels_all) if labels_all else None
+        )
+
+    def _calculate_scores(self, X):
+        if X is None or len(X) == 0:
+            return np.array([])
+
+        is_if_model = HAS_IFOREST and isinstance(self.model, IsolationForest)
+        model_type_name = type(self.model).__name__.lower()
+
+        if is_if_model or "isolationforest" in model_type_name or "iforest" in model_type_name:
+            if hasattr(self.model, "decision_function"):
+                return -self.model.decision_function(X)
+            elif hasattr(self.model, "score_samples"):
+                return -self.model.score_samples(X)
+
+        if hasattr(self.model, "score"):
+            scores = self.model.score(X)
+            if self.config.get("model", {}).get("auto_invert_scores", False) and np.mean(scores) < 0:
+                return -scores
+            return scores
+
+        raise ValueError("❌ Erro: O Modelo não possui um método de escoragem válido!")
+
+    def _persist_meta(self, meta_path):
+        """Persiste scalers, feature_columns e (se anexados) fp/tb."""
+        meta_dict = {
+            "scalers": self.scalers,
+            "feature_columns": self.feature_columns,
+            "training_protocol": TRAINING_PROTOCOL_VERSION,
+        }
+        if self.feature_processor is not None:
+            meta_dict["feature_processor"] = self.feature_processor
+        if self.temporal_builder is not None:
+            meta_dict["temporal_builder"] = self.temporal_builder
+        with open(meta_path, "wb") as f:
+            pickle.dump(meta_dict, f)
+
+    def run(self, train_df, val_df, test_df, feature_columns=None):
+        train_df = train_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
+        if test_df is not None:
+            test_df = test_df.reset_index(drop=True)
+
+        self.user_thresholds = {}
+        self.global_threshold = 0.0
+
+        train_cfg = self.config.get("training", {})
+        do_resume = train_cfg.get("resume", False)
+        save_model = train_cfg.get("save_model", True)
+        thresh_mode = train_cfg.get("threshold_mode", "per_user")
+
+        is_supervised = train_cfg.get("supervised", False)
+        target_attack = train_cfg.get("target_attack_type", None)
+
+        fixed_threshold = train_cfg.get("fixed_threshold", None)
+        fixed_percentile = train_cfg.get("fixed_percentile", None)
+        target = self.config.get("data", {}).get("target_col", "Is_Anomaly")
+
+        model_path = os.path.join(self.output_dir, "saved_model")
+        meta_path = os.path.join(self.output_dir, "trainer_meta.pkl")
+
+        # -------------------- TREINO --------------------
+        if (do_resume and os.path.exists(model_path) and os.path.exists(meta_path)
+                and self._checkpoint_uses_current_protocol(meta_path)):
+            print("🔄 [Trainer] Checkpoint detectado. Retomando execução...")
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+                self.scalers = meta['scalers']
+                self.feature_columns = meta['feature_columns']
+            if hasattr(self.model, "load"):
+                self.model.load(model_path)
+        else:
+            print(f"🚀 [Trainer] Iniciando treino do zero (Modo: {thresh_mode})...")
+
+            if is_supervised:
+                X_train, _, _, y_train = self._build_sequences(
+                    train_df, fit=True, return_labels=True,
+                    feature_columns=feature_columns
+                )
+            else:
+                X_train, _, _, y_train = self._build_benign_training_sequences(
+                    train_df, feature_columns=feature_columns
+                )
+                if y_train is not None:
+                    y_train = y_train[y_train == 0]
+            if len(X_train) == 0:
+                raise ValueError("Nenhuma janela de treino elegível foi gerada.")
+
+            if y_train is None:
+                y_train = np.zeros(len(X_train))
+
+            if is_supervised and len(np.unique(y_train)) < 2:
+                raise ValueError(
+                    "Treino supervisionado com uma única classe. "
+                    "Forneça ataques na partição de treino ou remova o modelo supervisionado."
+                )
+
+            if hasattr(self.model, "fit"):
+                if is_supervised:
+                    self.model.fit(X_train, y=y_train)
+                else:
+                    self.model.fit(X_train)
+
+            if save_model:
+                os.makedirs(model_path, exist_ok=True)
+                if hasattr(self.model, "save"):
+                    self.model.save(model_path)
+                self._persist_meta(meta_path)
+                print(f"💾 [Trainer] Modelo e metadados salvos em: {model_path}")
+
+        # -------------------- VALIDAÇÃO --------------------
+        print("\n--- [Trainer] Gerando Janelas de VALIDAÇÃO ---")
+
+        if target_attack and "AnomalyType" in val_df.columns:
+            print(f"   🔍 [ESPECIALISTA] Filtrando validação para '{target_attack}'...")
+            mask = (val_df[target] == 0) | (val_df["AnomalyType"] == target_attack)
+            val_df = val_df[mask].copy()
+
+        X_val, _, val_users, y_val = self._build_sequences(val_df, fit=False, return_labels=True)
+        if X_val is None or len(X_val) == 0:
+            raise ValueError("❌ Conjunto de VALIDAÇÃO gerou 0 janelas.")
+
+        val_scores = self._calculate_scores(X_val)
+
+        if y_val is not None and np.sum(y_val) > 0:
+            print(f"   ✅ Validação contém {int(np.sum(y_val))} janelas anômalas.")
+        else:
+            print(f"   ❌ ATENÇÃO: Validação livre de anomalias!")
+
+        best_p, best_f2 = 95.0, -1.0
+        print("\n--- [Trainer] Definição de Limiares ---")
+
+        if fixed_threshold is not None:
+            self.global_threshold = float(fixed_threshold)
+            self.user_thresholds = {"__GLOBAL_FALLBACK__": self.global_threshold}
+            print(f"⚖️ [YAML] Limiar absoluto fixado: {fixed_threshold}")
+
+        elif fixed_percentile is not None:
+            best_p = float(fixed_percentile)
+            self.global_threshold = float(np.percentile(val_scores, best_p)) if val_scores.size > 0 else 0.5
+            self.user_thresholds = {"__GLOBAL_FALLBACK__": self.global_threshold}
+            if thresh_mode == "per_user":
+                self.user_thresholds.update(
+                    self._personalized_thresholds(val_scores, val_users, y_val, best_p)
+                )
+            print(f"⚖️ [YAML] Percentil fixado: {best_p}%")
+
+        else:
+            if y_val is not None and np.sum(y_val) > 0:
+                print(f"🧠 [AUTO] Otimizando com F2-Score...")
+                calibration_cfg = train_cfg.get("threshold_search", {})
+                percentile_min = float(calibration_cfg.get("percentile_min", 0.0))
+                percentile_max = float(calibration_cfg.get("percentile_max", 99.5))
+                percentile_step = float(calibration_cfg.get("percentile_step", 0.5))
+                if not (0 <= percentile_min < percentile_max <= 100) or percentile_step <= 0:
+                    raise ValueError("Configuração inválida em training.threshold_search.")
+                for p in np.arange(percentile_min, percentile_max + percentile_step / 2, percentile_step):
+                    t_glob = np.percentile(val_scores, p)
+                    if thresh_mode == "per_user":
+                        u_t_dict = self._personalized_thresholds(
+                            val_scores, val_users, y_val, p
+                        )
+                        y_pred = (val_scores > np.array([u_t_dict.get(str(uid), t_glob) for uid in val_users])).astype(int)
+                    else:
+                        y_pred = (val_scores > t_glob).astype(int)
+
+                    f2 = self._compute_f2_score(y_val, y_pred)
+                    if f2 > best_f2:
+                        best_f2, best_p = f2, p
+                print(f"✅ [AUTO] Percentil ideal: {best_p:.1f}% (F2: {best_f2:.4f})")
+            else:
+                best_p = 99.0
+                print(f"⚠️ [AUTO] Validação limpa. Percentil de segurança: {best_p}%")
+
+            self.global_threshold = float(np.percentile(val_scores, best_p)) if val_scores.size > 0 else 0.5
+            self.user_thresholds = {"__GLOBAL_FALLBACK__": self.global_threshold}
+            if thresh_mode == "per_user":
+                self.user_thresholds.update(
+                    self._personalized_thresholds(val_scores, val_users, y_val, best_p)
+                )
+
+        with open(os.path.join(self.output_dir, "user_thresholds.json"), "w") as f:
+            json.dump(self.user_thresholds, f, indent=4)
+
+        print("\n--- [Trainer] Execução Finalizada ---")
+        return {
+            "val_f2": float(best_f2) if best_f2 != -1 else -1.0,
+            "global_threshold": self.global_threshold
+        }
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/temporal_builder.py
+================================================================================
+# core/temporal_builder.py
+
+import pandas as pd
+import numpy as np
+
+
+class TemporalBuilder:
+    def __init__(self, config):
+        self.config = config
+        temporal_cfg = config.get("temporal", {})
+        self.session_timeout = temporal_cfg.get("session_timeout", 3600)
+        # min_events_session: se > 1, sessões menores viram NaN (descartadas
+        # quando window_grouping='session'). Default 1 = comportamento anterior.
+        self.min_events_session = max(1, int(temporal_cfg.get("min_events_session", 1)))
+
+    def transform(self, df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        print(f"🕒 [TemporalBuilder] Processando dinâmica temporal (Timeout: {self.session_timeout}s, MinEvents: {self.min_events_session})...")
+
+        df_temp = df.copy()
+
+        if 'Time' not in df_temp.columns:
+            print("⚠️ Coluna 'Time' ausente. Retornando dataset bruto.")
+            return df_temp
+
+        if not pd.api.types.is_numeric_dtype(df_temp['Time']):
+            print("⚠️ Coluna 'Time' não é numérica. Retornando dataset bruto.")
+            return df_temp
+
+        # Aviso (sem dropar): valores não-finitos em Time podem contaminar sessões
+        n_bad_time = int((~np.isfinite(df_temp['Time'].astype(float))).sum())
+        if n_bad_time > 0:
+            print(f"   ⚠️ {n_bad_time} eventos com Time inválido (NaN/inf). Considere filtrar antes.")
+
+        # Ordenação estável (determinismo em empates)
+        df_temp = df_temp.sort_values(by=['UserID', 'Time'], kind='stable').reset_index(drop=True)
+
+        # Cálculo de delta e sessão
+        df_temp['time_diff'] = df_temp.groupby('UserID', sort=False)['Time'].diff().fillna(0)
+        df_temp['new_session'] = (df_temp['time_diff'] > self.session_timeout).astype(int)
+        df_temp['session_id'] = df_temp.groupby('UserID', sort=False)['new_session'].cumsum()
+        df_temp['session_id'] = df_temp['UserID'].astype(str) + "_" + df_temp['session_id'].astype(str)
+
+        # Filtro opcional de sessões pequenas
+        if self.min_events_session > 1:
+            sizes = df_temp.groupby('session_id')['session_id'].transform('size')
+            mask_tiny = sizes < self.min_events_session
+            df_temp.loc[mask_tiny, 'session_id'] = None
+
+        df_temp = df_temp.drop(columns=['time_diff', 'new_session'])
+
+        n_sessions = df_temp['session_id'].nunique()
+        print(f"   ✅ Sessões identificadas. Total de sessões válidas: {n_sessions}")
+
+        return df_temp
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/utils/config_validator.py
+================================================================================
+class ConfigValidator:
+
+    def __init__(self, config):
+        self.config = config
+
+    def validate(self):
+
+        cfg = self.config
+
+        # =========================================================
+        # DATA
+        # =========================================================
+        if "data" not in cfg:
+            raise ValueError("Missing 'data' section")
+
+        data_cfg = cfg["data"]
+
+        # aceita path único OU split
+        if not (
+            "path" in data_cfg or
+            (
+                "train_path" in data_cfg and
+                "val_path" in data_cfg and
+                "test_path" in data_cfg
+            )
+        ):
+            raise ValueError(
+                "data must have either 'path' OR "
+                "'train_path', 'val_path', 'test_path'"
+            )
+
+        # =========================================================
+        # MODEL
+        # =========================================================
+        if "model" not in cfg:
+            raise ValueError("Missing 'model' section")
+
+        if "type" not in cfg["model"]:
+            raise ValueError("Missing 'model.type'")
+
+        if "sequence_length" not in cfg["model"]:
+            raise ValueError("Missing 'model.sequence_length'")
+
+        # =========================================================
+        # SAMPLING
+        # =========================================================
+        if "sampling" in cfg:
+
+            mode = cfg["sampling"].get("mode", "full")
+
+            if mode not in ["full", "debug"]:
+                raise ValueError("sampling.mode must be 'full' or 'debug'")
+
+        print("✅ Config validation passed")
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/data/dataset_adapter.py
+================================================================================
+import os
+import json
+import pandas as pd
+import glob
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+class DatasetAdapter:
+    def __init__(self, config):
+        self.config = config
+        self.data_cfg = config.get("data", {})
+        self.sampling_cfg = config.get("sampling", {})
+        self.output_dir = config.get("output_dir", "./results/default_run")
+        self.target_col = self.data_cfg.get("target_col", "Is_Anomaly")
+        self.label_filename = self.data_cfg.get("label_filename", "labels.csv")
+        self.mode = self.sampling_cfg.get("mode", "full")
+
+    # =========================================================
+    # 🔥 RESTAURADO: Normalização completa (mapeamento de colunas)
+    # =========================================================
+    def _normalize(self, df):
+        if df is None or df.empty:
+            return df
+        df.columns = [str(c).strip() for c in df.columns]
+        
+        maps = {
+            'userid': 'UserID', 'user': 'UserID', 'username': 'UserID', 'src_user': 'UserID',
+            'timestamp': 'Time', 'time': 'Time', 'date': 'Time', 'datetime': 'Time',
+            'loghost': 'LogHost', 'pc': 'LogHost', 'host': 'LogHost', 'machine': 'LogHost',
+            'eventid': 'EventID', 'id': 'EventID', 'event_id': 'EventID',
+            'processname': 'ProcessName', 'process': 'ProcessName', 'proc': 'ProcessName',
+            'filename': 'ProcessName'
+        }
+        
+        cols_low = {str(c).lower(): c for c in df.columns}
+        rename_map = {cols_low[k]: v for k, v in maps.items() if k in cols_low}
+        if rename_map:
+            df = df.rename(columns=rename_map)
+            if df.columns.duplicated().any():
+                df = df.loc[:, ~df.columns.duplicated()]
+        
+        if 'UserID' in df.columns:
+            df['UserID'] = df['UserID'].astype(str)
+        if 'EventID' in df.columns:
+            df['EventID'] = pd.to_numeric(df['EventID'], errors='coerce').fillna(0).astype(np.int64)
+        
+        # Tratamento de tempo (estratégias do config)
+        if 'Time' in df.columns:
+            if not pd.api.types.is_numeric_dtype(df['Time']):
+                try:
+                    temp_dt = pd.to_datetime(df['Time'], errors='coerce')
+                    df['Time'] = temp_dt.astype('int64') / 1e9
+                except:
+                    pass
+            df['Time'] = df['Time'].replace([np.inf, -np.inf], np.nan)
+            strat = self.data_cfg.get("time_nan_strategy", "zero")
+            if strat == "min":
+                min_time = df['Time'].min(skipna=True)
+                df['Time'] = df['Time'].fillna(min_time if not pd.isna(min_time) else 0.0)
+            elif strat == "zero":
+                df['Time'] = df['Time'].fillna(0.0)
+        return df
+
+    # =========================================================
+    # 🔥 RESTAURADO: Merge com labels.csv
+    # =========================================================
+    def _apply_auto_labels(self, df, resource_path, specific_label_path=None):
+        if df is None or df.empty:
+            return df
+        if self.target_col in df.columns and df[self.target_col].sum() > 0:
+            return df
+
+        label_file = None
+        if specific_label_path and os.path.exists(specific_label_path):
+            label_file = specific_label_path
+        elif os.path.isdir(resource_path):
+            candidate = os.path.join(resource_path, self.label_filename)
+            if os.path.exists(candidate):
+                label_file = candidate
+        elif os.path.exists(os.path.join(os.path.dirname(resource_path), self.label_filename)):
+            label_file = os.path.join(os.path.dirname(resource_path), self.label_filename)
+
+        if not label_file:
+            if self.target_col not in df.columns:
+                df[self.target_col] = 0
+            return df
+
+        try:
+            label_df = pd.read_csv(label_file)
+            label_df = self._normalize(label_df)
+            label_df[self.target_col] = 1
+
+            df['_t_key'] = (df['Time'].fillna(0.0) * 1000).round(0).astype(np.int64)
+            label_df['_t_key'] = (label_df['Time'].fillna(0.0) * 1000).round(0).astype(np.int64)
+
+            keys = ['UserID', '_t_key']
+            for col in ['LogHost', 'EventID']:
+                if col in df.columns and col in label_df.columns:
+                    keys.append(col)
+
+            valid_keys = [k for k in keys if k in label_df.columns and k in df.columns]
+            subset = label_df[valid_keys + [self.target_col]].drop_duplicates(subset=valid_keys)
+            df = df.merge(subset, on=valid_keys, how='left', suffixes=('', '_lbl'))
+
+            lbl_col = f"{self.target_col}_lbl"
+            if lbl_col in df.columns:
+                df[self.target_col] = df[lbl_col].fillna(0).astype(int)
+                df.drop(columns=[lbl_col], inplace=True)
+            elif self.target_col not in df.columns:
+                df[self.target_col] = 0
+
+            df.drop(columns=['_t_key'], inplace=True, errors='ignore')
+            print(f"🚩 Gabarito '{os.path.basename(label_file)}' aplicado.")
+        except Exception as e:
+            print(f"❌ Erro nos labels: {e}")
+            if self.target_col not in df.columns:
+                df[self.target_col] = 0
+        return df
+
+    # =========================================================
+    # 🔥 RESTAURADO: Leitura robusta com glob
+    # =========================================================
+    def _load_resource(self, path, sample_size=0):
+        if not path or not os.path.exists(path):
+            return pd.DataFrame()
+        
+        files = sorted(glob.glob(os.path.join(path, "*.*"))) if os.path.isdir(path) else [path]
+        files = [f for f in files if self.label_filename not in f]
+
+        df_list = []
+        rows_acc = 0
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            nrows = None
+            if self.mode == "debug" and sample_size > 0:
+                nrows = max(0, sample_size - rows_acc)
+                if nrows == 0:
+                    break
+            try:
+                is_jsonl = "json" in ext
+                if not is_jsonl:
+                    # Some JSON Lines samples are distributed with a .txt suffix.
+                    with open(f, "r", encoding="utf-8-sig") as source:
+                        is_jsonl = source.read(4096).lstrip().startswith("{")
+                if is_jsonl:
+                    temp = pd.read_json(f, lines=True, nrows=nrows)
+                else:
+                    temp = pd.read_csv(f, nrows=nrows)
+                if not temp.empty:
+                    df_list.append(temp)
+                    rows_acc += len(temp)
+                if self.mode == "debug" and rows_acc >= sample_size:
+                    break
+            except:
+                continue
+        return pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+
+    # =========================================================
+    # 🆕 NOVO (bom): Split Dinâmico com Auditoria
+    # =========================================================
+    def _perform_dynamic_split(self, master_df):
+        split_mode = self.sampling_cfg.get("split_strategy", "chronological")
+        ratios = self.sampling_cfg.get("split_ratios", {"train": 0.7, "val": 0.2, "test": 0.1})
+        train_ratio, val_ratio = ratios.get("train", 0.7), ratios.get("val", 0.2)
+        test_ratio = ratios.get("test", 0.1)
+        seed = self.config.get("training", {}).get("seed", 42)
+
+        print(f"🔪 Split Dinâmico ({split_mode.upper()}) | {train_ratio}/{val_ratio}/{test_ratio}")
+
+        if split_mode == "chronological":
+            if 'Time' in master_df.columns:
+                master_df = master_df.sort_values(by='Time').reset_index(drop=True)
+            n = len(master_df)
+            train_end = int(n * train_ratio)
+            val_end = train_end + int(n * val_ratio)
+            train_df, val_df, test_df = master_df.iloc[:train_end].copy(), master_df.iloc[train_end:val_end].copy(), master_df.iloc[val_end:].copy()
+        else:  # random
+            n = len(master_df)
+            train_size = int(n * train_ratio)
+            val_size = int(n * val_ratio)
+            test_size = n - train_size - val_size
+            if min(train_size, val_size, test_size) <= 0:
+                raise ValueError("As proporções de split devem gerar partições não vazias.")
+            train_val_df, test_df = train_test_split(
+                master_df, test_size=test_size, random_state=seed, shuffle=True
+            )
+            train_df, val_df = train_test_split(
+                train_val_df, test_size=val_size, random_state=seed, shuffle=True
+            )
+            # Reordena para manter coerência temporal interna
+            for df in [train_df, val_df, test_df]:
+                if 'Time' in df.columns:
+                    df.sort_values(by='Time', inplace=True)
+                df.reset_index(drop=True, inplace=True)
+
+        # Auditoria
+        os.makedirs(self.output_dir, exist_ok=True)
+        train_df.to_csv(os.path.join(self.output_dir, "train_audit.csv"), index=False)
+        val_df.to_csv(os.path.join(self.output_dir, "val_audit.csv"), index=False)
+        test_df.to_csv(os.path.join(self.output_dir, "test_audit.csv"), index=False)
+
+        split_frames = {"train": train_df, "validation": val_df, "test": test_df}
+        split_audit = {"strategy": split_mode, "seed": int(seed), "partitions": {}, "overlap": {}}
+        for partition_name, partition in split_frames.items():
+            positives = int(partition[self.target_col].fillna(0).sum()) if self.target_col in partition else 0
+            split_audit["partitions"][partition_name] = {
+                "events": int(len(partition)),
+                "anomalous_events": positives,
+                "event_prevalence": float(positives / len(partition)) if len(partition) else 0.0,
+                "users": int(partition["UserID"].nunique()) if "UserID" in partition else 0,
+                "attack_ids": int(partition["AttackID"].nunique()) if "AttackID" in partition else 0,
+                "time_min": float(partition["Time"].min()) if "Time" in partition and len(partition) else None,
+                "time_max": float(partition["Time"].max()) if "Time" in partition and len(partition) else None,
+            }
+
+        for left, right in (("train", "validation"), ("train", "test"), ("validation", "test")):
+            split_audit["overlap"][f"{left}_{right}"] = {}
+            for column in ("UserID", "AttackID"):
+                if column in split_frames[left] and column in split_frames[right]:
+                    left_values = set(split_frames[left][column].dropna().astype(str))
+                    right_values = set(split_frames[right][column].dropna().astype(str))
+                    split_audit["overlap"][f"{left}_{right}"][column] = len(left_values & right_values)
+
+        audit_path = os.path.join(self.output_dir, f"split_audit_{split_mode}_seed{seed}.json")
+        with open(audit_path, "w", encoding="utf-8") as audit_file:
+            json.dump(split_audit, audit_file, indent=2, ensure_ascii=False)
+
+        print(f"   ✅ Auditoria salva em: {self.output_dir}")
+        print(f"   📊 Tamanhos: Treino({len(train_df)}) | Val({len(val_df)}) | Teste({len(test_df)})")
+        return train_df, val_df, test_df
+
+    # =========================================================
+    # 🔥 RESTAURADO: Alinhamento de colunas comuns
+    # =========================================================
+    def load(self):
+        dataset_path = self.data_cfg.get("dataset_path", "")
+        train_path = self.data_cfg.get("train_path", "")
+        val_path = self.data_cfg.get("val_path", "")
+        test_path = self.data_cfg.get("test_path", "")
+
+        limit_train = self.sampling_cfg.get("train_size", 0)
+        limit_val = self.sampling_cfg.get("val_size", 0)
+        limit_test = self.sampling_cfg.get("test_size", 0)
+
+        # Modo Smart A: Arquivo Único (Split Dinâmico)
+        if dataset_path and os.path.exists(dataset_path):
+            master_df = self._load_resource(dataset_path, limit_train)
+            master_df = self._normalize(master_df)
+            master_df = self._apply_auto_labels(master_df, dataset_path)
+            return self._perform_dynamic_split(master_df)
+
+        # Modo Smart B: Arquivos já separados (Clássico)
+        print(f"📂 Carregamento Clássico (Modo: {self.mode})")
+        train_df = self._load_resource(train_path, limit_train)
+        val_df = self._load_resource(val_path, limit_val)
+        test_df = self._load_resource(test_path, limit_test)
+
+        train_df = self._normalize(train_df)
+        val_df = self._normalize(val_df)
+        test_df = self._normalize(test_df)
+
+        train_df = self._apply_auto_labels(train_df, train_path)
+        val_df = self._apply_auto_labels(val_df, val_path)
+        test_df = self._apply_auto_labels(test_df, test_path)
+
+        # ✅ Alinhamento de colunas (restaurado)
+        valid_dfs = [df for df in [train_df, val_df, test_df] if df is not None and not df.empty]
+        if valid_dfs:
+            common_cols = set(valid_dfs[0].columns)
+            for df in valid_dfs[1:]:
+                common_cols.intersection_update(df.columns)
+            for mandatory in ['UserID', 'Time', self.target_col]:
+                if mandatory not in common_cols:
+                    common_cols.add(mandatory)
+            common_cols = sorted(list(common_cols))
+            
+            for i, df in enumerate([train_df, val_df, test_df]):
+                if df is not None and not df.empty:
+                    if self.target_col not in df.columns:
+                        df[self.target_col] = 0
+                    df = df[common_cols]
+                    if i == 0:
+                        train_df = df
+                    elif i == 1:
+                        val_df = df
+                    else:
+                        test_df = df
+
+        print(f"   ✅ Treino: {len(train_df) if train_df is not None else 0} registros.")
+        print(f"   ✅ Val: {len(val_df) if val_df is not None else 0} registros.")
+        print(f"   ✅ Teste: {len(test_df) if test_df is not None else 0} registros.")
+        return train_df, val_df, test_df
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/data/dataset_inspector.py
+================================================================================
+import pandas as pd
+import os
+import glob
+import logging
+from core.features.feature_registry import FEATURE_REGISTRY
+
+class DatasetInspector:
+    """
+    O Auditor do Esquadrão:
+    Valida cabeçalhos e traduz a capacidade técnica em cobertura de ataques.
+    """
+    def __init__(self, config):
+        self.config = config
+        self.data_cfg = config.get("data", {})
+        self.label_filename = self.data_cfg.get("label_filename", "labels.csv")
+        
+        # Mapeamento Semântico: Traduz Features em Ameaças Detectáveis
+        self.attack_mapping = {
+            "temporal_anomaly": ["Out of Hours", "Unusual Admin Activity", "Service Abuse"],
+            "volume_anomaly": ["Brute Force (Volume)", "Data Exfiltration", "DoS Patterns"],
+            "auth_failure": ["Brute Force (Login)", "Password Spraying"],
+            "lateral_movement": ["Lateral Movement", "Pass-the-Hash (Move)", "RDP Anomaly"],
+            "process_anomaly": ["Malware Execution", "Unusual Admin Tools"],
+            "privilege_anomaly": ["Privilege Escalation", "Admin Tool Abuse"],
+            "rdp_anomaly": ["Remote Access Abuse", "Lateral Movement (RDP)"],
+            "golden_ticket": ["Ticket Forgery", "Pass-the-Hash (Auth)"]
+        }
+
+        self.maps = {
+            'userid': 'UserID', 'user': 'UserID', 'username': 'UserID',
+            'timestamp': 'Time', 'time': 'Time', 'date': 'Time',
+            'loghost': 'LogHost', 'pc': 'LogHost', 'host': 'LogHost',
+            'eventid': 'EventID', 'id': 'EventID',
+            'processname': 'ProcessName', 'filename': 'ProcessName'
+        }
+
+    def inspect_all(self):
+        """Executa a auditoria e imprime o relatório no terminal."""
+        print(f"\n{'='*60}")
+        print(f"🔎 INSPEÇÃO TÉCNICA E SEMÂNTICA")
+        print(f"{'='*60}")
+        
+        train_path = self.data_cfg.get("train_path")
+        if not train_path or not os.path.exists(train_path):
+            print(f"❌ Erro: Caminho de treino não encontrado.")
+            return False
+
+        headers = self._get_headers(train_path)
+        if not headers: return False
+
+        clean_headers, _ = self._analyze_mapping(headers)
+        
+        print(f"Dataset: {os.path.basename(train_path)}")
+        missing_vital = [c for c in ['UserID', 'Time'] if c not in clean_headers]
+        if missing_vital:
+            print(f"🚨 STATUS: FALHA (Faltam colunas vitais: {missing_vital})")
+            return False
+        
+        self._report_attack_coverage(clean_headers)
+        print(f"{'='*60}\n")
+        return True
+
+    def _get_headers(self, path):
+        try:
+            target = path
+            if os.path.isdir(path):
+                files = sorted(glob.glob(os.path.join(path, "*.*")))
+                files = [f for f in files if self.label_filename not in f]
+                if not files: return None
+                target = files[0]
+            ext = os.path.splitext(target)[1].lower()
+            df = pd.read_json(target, lines=True, nrows=1) if "json" in ext else pd.read_csv(target, nrows=1)
+            return [str(c).strip() for c in df.columns]
+        except: return None
+
+    def _analyze_mapping(self, headers):
+        clean = [self.maps.get(h.lower(), h) for h in headers]
+        return clean, ""
+
+    def _report_attack_coverage(self, clean_headers):
+        available_cols = set(clean_headers)
+        active_attacks = set()
+        print(f"\n🎯 COBERTURA DE ATAQUES ESTIMADA:")
+        print(f"{'-'*60}")
+        
+        for group, attacks in self.attack_mapping.items():
+            spec = FEATURE_REGISTRY.get(group)
+            if not spec: continue
+            
+            if set(spec["required"]).issubset(available_cols):
+                for a in attacks: active_attacks.add(a)
+                print(f"  ✅ {group.ljust(18)} -> {', '.join(attacks)}")
+            else:
+                missing = set(spec["required"]) - available_cols
+                print(f"  ❌ {group.ljust(18)} -> (Faltam: {missing})")
+
+        print(f"{'-'*60}")
+        print(f"🚀 O Esquadrão monitoriza {len(active_attacks)} tipos de ameaças.")
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/features/feature_registry.py
+================================================================================
+FEATURE_REGISTRY = {
+
+    "auth_failure": {
+        "required": ["Time", "UserID", "EventID"],
+        "builder": "build_auth_failure",
+        "attacks": ["bruteforce", "credential_stuffing"]
+    },
+
+    "lateral_movement": {
+        "required": ["Time", "UserID", "LogHost"],
+        "builder": "build_lateral",
+        "attacks": ["lateral_movement", "pass_the_hash"]
+    },
+
+    "temporal_anomaly": {
+        "required": ["Time", "UserID"],
+        "builder": "build_temporal",
+        "attacks": ["out_of_hours"]
+    },
+
+    "volume_anomaly": {
+        "required": ["Time", "UserID"],
+        "builder": "build_volume",
+        "attacks": ["volume_spike"]
+    },
+
+    "rdp_anomaly": {
+        "required": ["EventID", "UserID"],
+        "builder": "build_rdp",
+        "attacks": ["rdp_anomaly"]
+    },
+
+    "golden_ticket": {
+        "required": ["EventID"],
+        "builder": "build_golden_ticket",
+        "attacks": ["golden_ticket"]
+    },
+
+    "process_anomaly": {
+        "required": ["ProcessName", "UserID"],
+        "builder": "build_process",
+        "attacks": ["service_abuse"]
+    },
+
+    "privilege_anomaly": {
+        "required": ["UserID", "ProcessName"],
+        "builder": "build_privilege",
+        "attacks": ["unusual_admin"]
+    }
+}
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/features/feature_processor.py
+================================================================================
+# core/features/feature_processor.py
+#
+# Feature engineering para detector UEBA.
+# - Anti-leakage: fit() só usa eventos normais (Is_Anomaly == 0)
+# - transform() em modo estrito NÃO reajusta o estado
+# - Features "_rate" representam estado no instante t (incluem evento atual);
+#   features "_count_*" são janelas temporais causais (olham para trás)
+# - Frequências de entidade usam baseline offline do treino
+#   (declarado como hipótese: offline training, não detecção online estrita)
+# - final_feature_names é congelado após o primeiro transform()
+# - Ordenação determinística (kind='stable')
+
+import pandas as pd
+import numpy as np
+import logging
+import pickle
+import os
+
+# =========================================================
+# REGISTRY
+# =========================================================
+FEATURE_REGISTRY = {
+    "auth_failure":      {"required": ["Time", "UserID", "EventID"], "builder": "build_auth_failure"},
+    "lateral_movement":  {"required": ["Time", "UserID", "LogHost", "EventID"], "builder": "build_lateral"},
+    "temporal_anomaly":  {"required": ["Time", "UserID"],            "builder": "build_temporal"},
+    "volume_anomaly":    {"required": ["Time", "UserID"],            "builder": "build_volume"},
+    "rdp_anomaly":       {"required": ["EventID", "UserID"],         "builder": "build_rdp"},
+    "golden_ticket":     {"required": ["EventID"],                   "builder": "build_golden_ticket"},
+    "process_anomaly":   {"required": ["ProcessName", "UserID"],     "builder": "build_process"},
+    "privilege_anomaly": {"required": ["UserID", "ProcessName"],     "builder": "build_privilege"},
+}
+
+
+class FeatureProcessor:
+    """
+    Constrói o vetor comportamental por evento, com anti-leakage no fit()
+    e features causais por usuário.
+
+    Em modo strict=True (default), transform() sem fit() levanta RuntimeError.
+    Em inferência, o estado do treino deve ser carregado via
+    meta['feature_processor'], nunca reajustado sobre o dataset de teste.
+    """
+
+    def __init__(self, config, strict: bool = True):
+        self.config = config
+        self.active_builders = []
+        self.features_frozen = False          # gate de _detect_features
+        self.final_feature_names = []         # congelado após primeiro transform
+        self.output_dir = config.get("output_dir")
+
+        feature_cfg = config.get("features", {})
+        self.rate_window = max(1, int(feature_cfg.get("rate_window", 20)))
+        self.excluded_features = set(feature_cfg.get("exclude_features", []))
+
+        self.historical_state = {}
+        self.is_fitted = False
+        self.strict = strict
+
+    # =========================================================
+    # PERSISTÊNCIA DE ESTADO (auditoria)
+    # =========================================================
+    def save_state(self) -> dict:
+        return {
+            "historical_state": self.historical_state,
+            "active_builders": list(self.active_builders),
+            "final_feature_names": list(self.final_feature_names),
+            "features_frozen": bool(self.features_frozen),
+            "rate_window": int(self.rate_window),
+            "is_fitted": bool(self.is_fitted),
+        }
+
+    def load_state(self, state: dict) -> None:
+        self.historical_state = state["historical_state"]
+        self.active_builders = list(state["active_builders"])
+        self.final_feature_names = list(state["final_feature_names"])
+        self.features_frozen = bool(state["features_frozen"])
+        self.rate_window = int(state.get("rate_window", self.rate_window))
+        self.is_fitted = bool(state.get("is_fitted", True))
+
+    # =========================================================
+    # AUXILIARES
+    # =========================================================
+    def _get_enabled_groups(self):
+        feat_cfg = self.config.get("features", {})
+        enabled = feat_cfg.get("enabled_groups", [])
+        if not enabled:
+            return set(FEATURE_REGISTRY.keys()) if feat_cfg.get("enabled", True) else set()
+        return set(enabled)
+
+    def _detect_features(self, df):
+        available = set(df.columns)
+        enabled = self._get_enabled_groups()
+
+        print(f"\n🛠️  CONSTRUINDO VETOR COMPORTAMENTAL (UEBA):")
+        for name, spec in FEATURE_REGISTRY.items():
+            if name not in enabled:
+                continue
+            if set(spec["required"]).issubset(available):
+                self.active_builders.append(spec["builder"])
+                print(f"  ✅ [BUILDER] '{name}' ATIVADA.")
+            else:
+                missing = set(spec["required"]) - available
+                print(f"  ❌ [SKIP] '{name}' ignorada. Faltam: {missing}")
+        self.features_frozen = True
+
+    def _rolling_rate(self, df, source_col):
+        """
+        Fração de eventos do tipo `source_col` na janela dos últimos
+        `rate_window` eventos. Inclui o evento atual → representa
+        'estado no instante t' (declarado na metodologia).
+        """
+        return df.groupby("UserID", sort=False)[source_col].transform(
+            lambda v: v.rolling(self.rate_window, min_periods=1).mean()
+        )
+
+    def _time_window_count(self, df, event_col, window_seconds, exclusive=False):
+        """
+        Conta eventos com event_col == 1 nos `window_seconds` anteriores a cada
+        evento, por usuário. Estritamente causal (só olha para trás).
+
+        Semântica para empates de Time: eventos com timestamp idêntico são
+        contados em ordem estável (o "próximo" no sort estável vê o "anterior"
+        como passado). `exclusive=True` exclui o próprio evento.
+        """
+        out = pd.Series(0.0, index=df.index, dtype=float)
+        if df.empty or event_col not in df.columns or "Time" not in df.columns:
+            return out
+
+        for _, idx in df.groupby("UserID", sort=False).groups.items():
+            sub = df.loc[idx, ["Time", event_col]].sort_values("Time", kind="stable")
+            times = sub["Time"].to_numpy(dtype=float)
+            vals = sub[event_col].to_numpy(dtype=float)
+
+            cumsum = np.concatenate([[0.0], np.cumsum(vals)])
+            left = np.searchsorted(times, times - window_seconds, side="left")
+            sums = cumsum[np.arange(len(times)) + 1] - cumsum[left]
+
+            if exclusive:
+                sums = sums - vals
+
+            out.loc[sub.index] = sums
+
+        return out
+
+    # =========================================================
+    # FIT (APENAS NORMAIS → anti-leakage)
+    # =========================================================
+    def fit(self, df):
+        if df is None or df.empty:
+            return
+
+        target_col = self.config.get("data", {}).get("target_col", "Is_Anomaly")
+        if target_col in df.columns:
+            df_temp = df[df[target_col] == 0].copy()
+            if df_temp.empty:
+                if self.strict:
+                    raise RuntimeError(
+                        "FeatureProcessor.fit: nenhum evento 'Is_Anomaly==0' no treino. "
+                        "Recusando ajustar baseline sobre eventos anômalos. "
+                        "Verifique o split ou rode com strict=False explicitamente."
+                    )
+                print("⚠️ ATENÇÃO: Nenhum evento 'normal'. Usando base total (pode gerar viés).")
+                df_temp = df.copy()
+        else:
+            df_temp = df.copy()
+
+        print("🧠 [FeatureProcessor] A processar os parâmetros históricos (APENAS NORMAIS)...")
+
+        if "Time" not in df_temp.columns:
+            print("⚠️ Coluna 'Time' não encontrada. Impossível extrair features temporais.")
+            return
+
+        df_temp["datetime"] = pd.to_datetime(df_temp["Time"], unit="s")
+        user_counts = df_temp.groupby("UserID", sort=False).size()
+
+        # ---------- Frequências por usuário ----------
+        if "LogHost" in df_temp.columns:
+            self.historical_state["loghost_freq"] = (
+                df_temp.groupby(["UserID", "LogHost"]).size() / user_counts
+            )
+            # Set de hosts por usuário (para user_host_new). Chaves forçadas a str.
+            self.historical_state["user_hosts_seen"] = {
+                str(uid): set(hosts.dropna().astype(str))
+                for uid, hosts in df_temp.groupby("UserID", sort=False)["LogHost"]
+            }
+
+        if "ProcessName" in df_temp.columns:
+            self.historical_state["process_freq"] = (
+                df_temp.groupby(["UserID", "ProcessName"]).size() / user_counts
+            )
+
+        if "IpAddress" in df_temp.columns:
+            self.historical_state["ip_freq"] = (
+                df_temp.groupby(["UserID", "IpAddress"]).size() / user_counts
+            )
+
+        if "SubStatus" in df_temp.columns:
+            self.historical_state["substatus_freq"] = (
+                df_temp.groupby(["UserID", "SubStatus"]).size() / user_counts
+            )
+
+        if "AuthenticationPackageName" in df_temp.columns:
+            self.historical_state["authpkg_freq"] = (
+                df_temp.groupby(["UserID", "AuthenticationPackageName"]).size() / user_counts
+            )
+
+        # ---------- Baseline temporal por usuário ----------
+        df_temp["hour"] = df_temp["datetime"].dt.hour
+        self.historical_state["hour_mean"] = df_temp.groupby("UserID")["hour"].mean()
+        self.historical_state["hour_std"] = df_temp.groupby("UserID")["hour"].std()
+
+        # ---------- Baseline de volume diário por usuário ----------
+        df_temp["date"] = df_temp["datetime"].dt.date
+        daily_counts = df_temp.groupby(["UserID", "date"]).size()
+        self.historical_state["daily_volume_mean"] = daily_counts.groupby("UserID").mean()
+        self.historical_state["daily_volume_std"] = daily_counts.groupby("UserID").std()
+
+        self.is_fitted = True
+        print("   ✅ Baseline comportamental (UEBA) estabelecido com sucesso.")
+
+    # =========================================================
+    # TRANSFORM
+    # =========================================================
+    def transform(self, df):
+        if df is None or df.empty:
+            return df
+
+        if not self.is_fitted:
+            if getattr(self, "strict", True):
+                raise RuntimeError(
+                    "FeatureProcessor.transform() chamado sem .fit() prévio. "
+                    "Em inferência, carregue o estado do treino via meta['feature_processor']. "
+                    "Em treino, chame .fit(train_df) antes de .transform()."
+                )
+            logging.warning("FeatureProcessor.transform sem .fit prévio — modo permissivo.")
+            self.fit(df)
+
+        df = df.copy()
+        df = df.sort_values(["UserID", "Time"], kind="stable").reset_index(drop=True)
+        df["datetime"] = pd.to_datetime(df["Time"], unit="s")
+
+        # ---------- 1. Frequency encoding por usuário ----------
+        encoders = [
+            ("LogHost",                    "loghost_freq",  "LogHost_enc"),
+            ("ProcessName",                "process_freq",  "ProcessName_enc"),
+            ("IpAddress",                  "ip_freq",       "IpAddress_enc"),
+            ("SubStatus",                  "substatus_freq","SubStatus_enc"),
+            ("AuthenticationPackageName",  "authpkg_freq",  "AuthPackage_enc"),
+        ]
+        for col, state_key, enc_col in encoders:
+            if col in df.columns and state_key in self.historical_state:
+                freq_map = self.historical_state[state_key].reset_index(name=enc_col)
+                df["_ord"] = range(len(df))
+                df = df.merge(freq_map, on=["UserID", col], how="left")
+                df = df.sort_values("_ord", kind="stable").drop(columns=["_ord"]).reset_index(drop=True)
+                df[enc_col] = df[enc_col].fillna(0.0)
+
+        if "_ord" in df.columns:
+            df = df.drop_duplicates(subset=["_ord"]).reset_index(drop=True)
+
+        # ---------- 2. Builders ----------
+        if not self.features_frozen:
+            self._detect_features(df)
+
+        for builder in self.active_builders:
+            if hasattr(self, builder):
+                df = getattr(self, builder)(df)
+
+        # ---------- 3. Interações cruzadas ----------
+        df = self._add_interactions(df)
+
+        # ---------- 4. Seleção final (congelada após 1º transform) ----------
+        meta_cols = [
+            "datetime", "LogHost", "ProcessName", "UserName", "SourceIP",
+            "UserID", "Time", "session_id", "AnomalyType", "EventID", "hour",
+            "IpAddress", "SubStatus", "AuthenticationPackageName",
+            "date", "new_session", "time_diff", "sub_session_id", "chunk_id",
+            "day_of_week", "time_sin", "time_cos", "is_weekend",
+            "Is_Anomaly", "_ord",
+            "is_failed", "is_success", "bad_password", "bad_username",
+            "account_locked", "rdp_event", "admin_activity",
+            "network_logon", "is_kerberos_logon", "recent_4768",
+            "rare_process",
+        ]
+
+        if not self.final_feature_names:
+            # Primeira chamada: computa e CONGELA
+            self.final_feature_names = [
+                c for c in df.columns
+                if c not in meta_cols
+                and c not in self.excluded_features
+                and pd.api.types.is_numeric_dtype(df[c])
+            ]
+            print(f"📊 Vetor de features CONGELADO: {len(self.final_feature_names)} dimensões.")
+        else:
+            # Chamadas seguintes: garante que todas as colunas congeladas existem
+            # (usuários/datasets novos podem não gerar alguma feature; zera).
+            for c in self.final_feature_names:
+                if c not in df.columns:
+                    df[c] = 0.0
+
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(os.path.join(self.output_dir, "feature_metadata.pkl"), "wb") as f:
+                pickle.dump({
+                    "features": self.final_feature_names,
+                    "state": self.historical_state,
+                }, f)
+
+        print(f"📊 Vetor Final ({len(df)} eventos): {len(self.final_feature_names)} dimensões.")
+
+        keep = self.final_feature_names + ["UserID", "Time", "Is_Anomaly", "AnomalyType"]
+        keep = list(dict.fromkeys(keep))
+        return df[[c for c in keep if c in df.columns]].fillna(0)
+
+    # =========================================================
+    # BUILDERS
+    # =========================================================
+    def build_temporal(self, df):
+        df["hour"] = df["datetime"].dt.hour
+
+        if "hour_mean" in self.historical_state:
+            mean = df["UserID"].map(self.historical_state["hour_mean"])
+            std = df["UserID"].map(self.historical_state["hour_std"]).fillna(3.0).clip(lower=0.5)
+
+            raw = (df["hour"] - mean).abs()
+            df["hour_dev"] = np.minimum(raw, 24 - raw).fillna(0)  # distância circular
+            df["hour_z"] = (df["hour_dev"] / std).fillna(0)
+            df["out_of_hours"] = (df["hour_z"] > 2.0).astype(int)
+        else:
+            df["out_of_hours"] = ((df["hour"] < 7) | (df["hour"] > 21)).astype(int)
+            df["hour_dev"] = 0.0
+            df["hour_z"] = 0.0
+
+        return df
+
+    def build_auth_failure(self, df):
+        df["is_failed"] = (df["EventID"] == 4625).astype(int)
+        df["is_success"] = (df["EventID"] == 4624).astype(int)
+
+        df["fail_rate"] = self._rolling_rate(df, "is_failed")
+        df["fail_count_5m"] = self._time_window_count(df, "is_failed", 300)
+        df["fail_count_15m"] = self._time_window_count(df, "is_failed", 900)
+        df["fail_count_60m"] = self._time_window_count(df, "is_failed", 3600)
+
+        prev_fails = self._time_window_count(df, "is_failed", 300, exclusive=True)
+        df["fail_then_success"] = ((df["is_success"] == 1) & (prev_fails > 2)).astype(int)
+
+        if "SubStatus" in df.columns:
+            sub = df["SubStatus"].astype(str).str.upper()
+            df["bad_password"] = ((df["EventID"] == 4625) & sub.str.contains("0XC000006A")).astype(int)
+            df["bad_username"] = ((df["EventID"] == 4625) & sub.str.contains("0XC0000064")).astype(int)
+            df["account_locked"] = ((df["EventID"] == 4625) & sub.str.contains("0XC0000234")).astype(int)
+
+            df["bad_pwd_rate"] = self._rolling_rate(df, "bad_password")
+            df["bad_pwd_count_15m"] = self._time_window_count(df, "bad_password", 900)
+
+            df["lock_rate"] = self._rolling_rate(df, "account_locked")
+            df["lock_count_60m"] = self._time_window_count(df, "account_locked", 3600)
+
+        return df
+
+    def build_lateral(self, df):
+        if "LogHost" in df.columns:
+            prev_host = df.groupby("UserID", sort=False)["LogHost"].shift()
+            df["host_changed"] = (
+                prev_host.notna()
+                & (df["LogHost"].astype(str) != prev_host.astype(str))
+            ).astype(int)
+
+            def _cumnunique(x):
+                seen, out = set(), []
+                for v in x:
+                    seen.add(v)
+                    out.append(len(seen))
+                return out
+
+            df["unique_hosts"] = df.groupby("UserID", sort=False)["LogHost"].transform(_cumnunique)
+
+            if "user_hosts_seen" in self.historical_state:
+                seen_map = self.historical_state["user_hosts_seen"]
+                df["user_host_new"] = [
+                    0 if str(h) in seen_map.get(str(u), set()) else 1
+                    for u, h in zip(df["UserID"], df["LogHost"])
+                ]
+
+        if "IpAddress" in df.columns:
+            prev_ip = df.groupby("UserID", sort=False)["IpAddress"].shift()
+            df["ip_changed"] = (
+                prev_ip.notna()
+                & (df["IpAddress"].astype(str) != prev_ip.astype(str))
+            ).astype(int)
+
+            def _cumnunique_ip(x):
+                seen, out = set(), []
+                for v in x:
+                    seen.add(v)
+                    out.append(len(seen))
+                return out
+
+            df["unique_ips"] = df.groupby("UserID", sort=False)["IpAddress"].transform(_cumnunique_ip)
+
+        if "LogonType" in df.columns:
+            df["network_logon"] = (
+                ((df["EventID"] == 4624) & (df["LogonType"] == 3))
+                | (df["EventID"] == 4648)
+            ).astype(int)
+            df["network_logon_rate"] = self._rolling_rate(df, "network_logon")
+            df["network_logon_count_60m"] = self._time_window_count(df, "network_logon", 3600)
+
+        return df
+
+    def build_volume(self, df):
+        if "date" in df.columns:
+            df["event_count"] = df.groupby(["UserID", "date"], sort=False).cumcount() + 1
+
+            if "daily_volume_mean" in self.historical_state:
+                mean_map = self.historical_state["daily_volume_mean"]
+                std_map = self.historical_state["daily_volume_std"]
+
+                df["vol_mean"] = df["UserID"].map(mean_map).fillna(0)
+                df["vol_std"] = df["UserID"].map(std_map).fillna(1)
+                df["event_z"] = ((df["event_count"] - df["vol_mean"]) / (df["vol_std"] + 1e-6)).fillna(0)
+            else:
+                df["event_z"] = 0.0
+
+            df.drop(columns=["vol_mean", "vol_std"], inplace=True, errors="ignore")
+
+        return df
+
+    def build_rdp(self, df):
+        if "LogonType" in df.columns:
+            df["rdp_event"] = ((df["EventID"] == 4624) & (df["LogonType"] == 10)).astype(int)
+        else:
+            df["rdp_event"] = (df["EventID"] == 4624).astype(int)
+
+        df["rdp_rate"] = self._rolling_rate(df, "rdp_event")
+        df["rdp_count_60m"] = self._time_window_count(df, "rdp_event", 3600)
+        return df
+
+    def build_golden_ticket(self, df):
+        if "AuthenticationPackageName" in df.columns:
+            pkg = df["AuthenticationPackageName"].astype(str).str.lower()
+            df["is_kerberos_logon"] = (
+                (df["EventID"] == 4624) & pkg.str.contains("kerberos")
+            ).astype(int)
+            df["is_ntlm"] = pkg.str.contains("ntlm").astype(int)
+
+            if "EventID" in df.columns:
+                df["recent_4768"] = self._time_window_count(
+                    df.assign(_evt4768=(df["EventID"] == 4768).astype(int)),
+                    "_evt4768", 600,
+                )
+                df.drop(columns=["_evt4768"], inplace=True, errors="ignore")
+
+                df["kerberos_logon_without_tgt"] = (
+                    (df["is_kerberos_logon"] == 1) & (df["recent_4768"] == 0)
+                ).astype(int)
+
+        return df
+
+    def build_process(self, df):
+        if "ProcessName_enc" in df.columns:
+            df["rare_process"] = (df["ProcessName_enc"] < 0.02).astype(int)
+            df["rare_process_rate"] = self._rolling_rate(df, "rare_process")
+            df["rare_process_count_60m"] = self._time_window_count(df, "rare_process", 3600)
+        return df
+
+    def build_privilege(self, df):
+        if "ProcessName" in df.columns:
+            proc_lower = df["ProcessName"].fillna("").astype(str).str.lower()
+            admin_tools = [
+                "powershell.exe", "cmd.exe", "wmic.exe", "ntdsutil.exe",
+                "psexec.exe", "mmc.exe", "vssadmin.exe",
+            ]
+            df["admin_activity"] = proc_lower.isin(admin_tools).astype(int)
+            df["admin_rate"] = self._rolling_rate(df, "admin_activity")
+            df["admin_count_60m"] = self._time_window_count(df, "admin_activity", 3600)
+        return df
+
+    # =========================================================
+    # INTERAÇÕES
+    # =========================================================
+    def _add_interactions(self, df):
+        if "out_of_hours" not in df.columns:
+            return df
+
+        ooh = df["out_of_hours"].astype(int)
+        for feat in ["admin_activity", "rdp_event", "is_success", "bad_password"]:
+            if feat in df.columns:
+                df[f"ooh_with_{feat}"] = ooh * df[feat].astype(int)
+
+        return df
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/models/base_model.py
+================================================================================
+
+##### ✅✅✅✅✅ core/models/base_model.py
+from abc import ABC, abstractmethod
+import numpy as np
+
+
+class BaseModel(ABC):
+    """
+    Classe base para todos os modelos de detecção de anomalia.
+
+    CONTRATO OBRIGATÓRIO:
+    - fit(X)
+    - score(X) → retorna anomaly score (quanto maior, mais anômalo)
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    # =====================================================
+    # TRAIN
+    # =====================================================
+
+    @abstractmethod
+    def fit(self, X: np.ndarray):
+        """
+        Treina o modelo.
+
+        Parâmetros:
+            X (np.ndarray): dados de treino (apenas normais idealmente)
+        """
+        pass
+
+    # =====================================================
+    # SCORE
+    # =====================================================
+
+    @abstractmethod
+    def score(self, X: np.ndarray) -> np.ndarray:
+        """
+        Retorna anomaly scores.
+
+        REGRA GLOBAL (CRÍTICA):
+        - scores maiores ⇒ MAIS ANOMALIA
+
+        Isso padroniza todos os modelos e permite:
+        - threshold único
+        - comparação justa
+        - cálculo consistente de PR-AUC
+
+        Retorna:
+            np.ndarray shape (n_samples,)
+        """
+        pass
+
+    # =====================================================
+    # PREDICT (PADRONIZAÇÃO)
+    # =====================================================
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Garante que qualquer chamada legado usando .predict() 
+        retorne exatamente o mesmo que .score(), mantendo a 
+        consistência da interface em todo o pipeline.
+        """
+        return self.score(X)
+
+    # =====================================================
+    # OPTIONAL: FIT + SCORE (para modelos que precisam)
+    # =====================================================
+
+    def fit_score(self, X: np.ndarray) -> np.ndarray:
+        """
+        Alguns modelos podem querer treinar e já retornar score.
+        (opcional, não obrigatório)
+        """
+        self.fit(X)
+        return self.score(X)
+
+    # =====================================================
+    # UTIL: GARANTIR FORMATO DE SAÍDA
+    # =====================================================
+
+    def _ensure_1d(self, scores):
+        """
+        Garante que scores sejam vetor 1D
+        """
+        scores = np.asarray(scores)
+
+        if scores.ndim > 1:
+            scores = scores.reshape(-1)
+
+        return scores
+
+    # =====================================================
+    # UTIL: NORMALIZAR DIREÇÃO DO SCORE
+    # =====================================================
+
+    def _ensure_higher_is_anomaly(self, scores, invert=False):
+        """
+        Alguns modelos (ex: sklearn) retornam:
+        - valores maiores = mais normal
+
+        Este método padroniza:
+        - valores maiores = mais anômalo
+
+        Parâmetros:
+            invert (bool): se True, inverte o sinal
+        """
+        scores = self._ensure_1d(scores)
+
+        if invert:
+            scores = -scores
+
+        return scores
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/models/model_factory.py
+================================================================================
+# core/models/model_factory.py
+import re
+import importlib
+import inspect
+import pkgutil
+import logging
+import core.models
+from core.models.base_model import BaseModel
+
+logger = logging.getLogger(__name__)
+
+MODEL_REGISTRY = {}
+_DISCOVERED = False
+
+def _to_snake(name: str) -> str:
+    """
+    Converte CamelCase para snake_case.
+    Ex: MLPAutoencoder -> mlp_autoencoder
+        IsolationForestModel -> isolation_forest
+        LOFModel -> lof
+    """
+    s = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', name)
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s).lower()
+    return s.replace('_model', '')  # remove o sufixo '_model' se existir
+
+def _discover_models():
+    global _DISCOVERED
+    if _DISCOVERED:
+        return
+        
+    logger.info("🔍 [ModelFactory] Percorrendo core.models para descoberta automática...")
+    
+    package_path = getattr(core.models, "__path__", [])
+    for _, module_name, _ in pkgutil.iter_modules(package_path):
+        if module_name in {"base_model", "model_factory"}:
+            continue
+        
+        full_module_name = f"core.models.{module_name}"
+        try:
+            module = importlib.import_module(full_module_name)
+            for name, obj in inspect.getmembers(module, inspect.isclass):
+                if issubclass(obj, BaseModel) and obj is not BaseModel:
+                    key = _to_snake(name)
+                    if key not in MODEL_REGISTRY:
+                        MODEL_REGISTRY[key] = obj
+                        logger.debug(f"  ✅ {key} -> {name}")
+                    else:
+                        logger.warning(f"  ⚠️ Chave '{key}' já registrada. Ignorando {name}.")
+        except Exception as e:
+            logger.error(f"  ❌ Erro ao carregar {full_module_name}: {e}")
+            
+    _DISCOVERED = True
+
+# Executa a descoberta no momento da importação
+_discover_models()
+
+# 🔥 REGISTRO MANUAL DE MODELOS ADICIONAIS (para garantir que estão disponíveis)
+try:
+    from core.models.random_forest_supervised import RandomForestSupervisedModel
+    MODEL_REGISTRY["random_forest_supervised"] = RandomForestSupervisedModel
+    logger.info("✅ RandomForestSupervisedModel registrado manualmente.")
+except ImportError as e:
+    logger.warning(f"⚠️ Não foi possível importar RandomForestSupervisedModel: {e}")
+
+# (Aqui você pode adicionar outros modelos manuais, se necessário)
+
+class ModelFactory:
+    @classmethod
+    def get_model(cls, config: dict) -> BaseModel:
+        model_cfg = config.get("model", {})
+        model_name = model_cfg.get("type")
+        
+        if not model_name or model_name not in MODEL_REGISTRY:
+            raise ValueError(
+                f"❌ Modelo '{model_name}' não encontrado.\n"
+                f"   Modelos disponíveis: {list(MODEL_REGISTRY.keys())}"
+            )
+        
+        model_class = MODEL_REGISTRY[model_name]
+        logger.info(f"🤖 Instanciando: {model_name} ({model_class.__name__})")
+        model = model_class(config)
+        
+        # Validação do contrato obrigatório (fit e score)
+        required = ("fit", "score")
+        missing = [m for m in required if not callable(getattr(model, m, None))]
+        if missing:
+            raise NotImplementedError(
+                f"🚨 O modelo '{model_name}' não implementa os métodos obrigatórios: {missing}"
+            )
+        return model
+
+    @classmethod
+    def register(cls, name: str, model_class):
+        """Permite registro manual se necessário (útil para testes ou plugins externos)."""
+        MODEL_REGISTRY[name] = model_class
+
+
+def create(config):
+    return ModelFactory.get_model(config)
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/models/mlp_single.py
+================================================================================
+# core/models/mlp_single.py
+# CORRIGIDO: Representação da janela agora usa 6 estatísticas (last, mean, std, min, max, sum)
+# Baseado nos resultados do diagnóstico: Teste 3 (janela estatística) atingiu PR-AUC 0.96.
+# Isso substitui a antiga representação (last + mean) que perdia sinal.
+import os
+import pickle
+import numpy as np
+from sklearn.neural_network import MLPRegressor
+import warnings
+
+from core.models.base_model import BaseModel
+
+
+class MLPSingleModel(BaseModel):
+    """
+    MLP Single (Otimizado para CPU usando Scikit-Learn).
+    Versão corrigida: expande a janela temporal para 6 estatísticas por feature:
+      - último evento
+      - média
+      - desvio padrão
+      - mínimo
+      - máximo
+      - soma
+    Entrada: sequence_length (20) × 16 features → 96 features de entrada.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        model_cfg = config.get("model", {}).get("mlp_single", {})
+
+        hidden_layer_sizes = model_cfg.get("hidden_layer_sizes", (32,))
+        if isinstance(hidden_layer_sizes, list):
+            hidden_layer_sizes = tuple(hidden_layer_sizes)
+
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.activation = model_cfg.get("activation", "relu")
+        self.solver = model_cfg.get("solver", "adam")
+        self.alpha = model_cfg.get("alpha", 0.0001)
+        self.batch_size = model_cfg.get("batch_size", "auto")
+        self.learning_rate_init = model_cfg.get("learning_rate_init", 0.001)
+        self.max_iter = model_cfg.get("max_iter", 200)
+        self.early_stopping = model_cfg.get("early_stopping", True)
+        self.validation_fraction = model_cfg.get("validation_fraction", 0.1)
+        self.random_state = config.get("training", {}).get("seed", 42)
+
+        self.model = None
+
+    # =====================================================
+    # PREPARAÇÃO DIMENSIONAL (CORRIGIDA)
+    # =====================================================
+    def _prepare_data(self, X):
+        """
+        Converte a matriz 3D do TemporalBuilder (janelas) em uma representação
+        2D enriquecida com 6 estatísticas por feature.
+        Antes: último evento + média (32 features)
+        Agora:  último + média + std + min + max + soma (96 features)
+        """
+        X_arr = np.asarray(X, dtype=np.float32)
+
+        if X_arr.ndim == 3:
+            # (n_samples, sequence_length, n_features)
+            X_last = X_arr[:, -1, :]                  # último evento
+            X_mean = np.mean(X_arr, axis=1)           # média
+            X_std = np.std(X_arr, axis=1)             # desvio padrão
+            X_min = np.min(X_arr, axis=1)             # mínimo
+            X_max = np.max(X_arr, axis=1)             # máximo
+            X_sum = np.sum(X_arr, axis=1)             # soma
+
+            return np.hstack([X_last, X_mean, X_std, X_min, X_max, X_sum])
+
+        return X_arr
+
+    # =====================================================
+    # TREINAMENTO
+    # =====================================================
+    #def fit(self, X): aqui seria para nunca aceitar treinar com dados de anomalia
+    def fit(self, X, y=None, **kwargs): #aqui deixei passar
+        X_processed = self._prepare_data(X)
+
+        self.model = MLPRegressor(
+            hidden_layer_sizes=self.hidden_layer_sizes,
+            activation=self.activation,
+            solver=self.solver,
+            alpha=self.alpha,
+            batch_size=self.batch_size,
+            learning_rate_init=self.learning_rate_init,
+            max_iter=self.max_iter,
+            early_stopping=self.early_stopping,
+            validation_fraction=self.validation_fraction,
+            random_state=self.random_state
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.model.fit(X_processed, X_processed)
+
+    # =====================================================
+    # CÁLCULO DE SCORE DE ANOMALIA
+    # =====================================================
+    def score(self, X):
+        X_processed = self._prepare_data(X)
+
+        if self.model is None:
+            raise ValueError("O modelo MLP Single precisa ser treinado antes de calcular scores.")
+
+        recon = self.model.predict(X_processed)
+        errors = (X_processed - recon) ** 2
+        scores = np.mean(errors, axis=1)
+
+        return self._ensure_higher_is_anomaly(scores, invert=False)
+   # =====================================================
+    # SALVAR E CARREGAR MODELO
+    # =====================================================
+    def save(self, path):
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "model.pkl"), "wb") as f:
+            pickle.dump(self.model, f)
+
+    def load(self, path):
+        with open(os.path.join(path, "model.pkl"), "rb") as f:
+            self.model = pickle.load(f)
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/core/models/random_forest_supervised.py
+================================================================================
+# core/models/random_forest_supervised.py
+import os
+import pickle
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+import warnings
+
+from core.models.base_model import BaseModel
+
+
+class RandomForestSupervisedModel(BaseModel):
+    """
+    Random Forest supervisionado para detecção de anomalias.
+    Treinado com rótulos explícitos (0 = Normal, 1 = Anomalia).
+    Retorna a probabilidade da classe 1 (anomalia).
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        model_cfg = config.get("model", {}).get("random_forest_supervised", {})
+
+        self.n_estimators = model_cfg.get("n_estimators", 150)
+        self.max_depth = model_cfg.get("max_depth", 8)
+        self.min_samples_split = model_cfg.get("min_samples_split", 10)
+        self.min_samples_leaf = model_cfg.get("min_samples_leaf", 5)
+        self.class_weight = model_cfg.get("class_weight", "balanced_subsample")
+        self.random_state = config.get("training", {}).get("seed", 42)
+        self.n_jobs = model_cfg.get("n_jobs", -1)
+
+        self.model = None
+
+    def _prepare_data(self, X):
+        """Aceita dados 2D ou 3D. Se 3D, achata (mas usamos sequence_length=1, então é 2D)."""
+        X_arr = np.asarray(X, dtype=np.float32)
+        if X_arr.ndim == 3:
+            X_arr = X_arr.reshape(X_arr.shape[0], -1)
+        return X_arr
+
+    def fit(self, X, y=None):
+        X_processed = self._prepare_data(X)
+
+        if y is None:
+            raise ValueError("O modelo supervisionado exige rótulos 'y'.")
+
+        self.model = RandomForestClassifier(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            min_samples_split=self.min_samples_split,
+            min_samples_leaf=self.min_samples_leaf,
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+            n_jobs=self.n_jobs
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.model.fit(X_processed, y)
+
+    def score(self, X):
+        X_processed = self._prepare_data(X)
+
+        if self.model is None:
+            raise ValueError("O modelo precisa ser treinado antes de calcular scores.")
+
+        # Retorna a probabilidade da classe 1 (anomalia)
+        probs = self.model.predict_proba(X_processed)
+        if probs.shape[1] == 1:
+            return np.zeros(len(X_processed))
+        
+        scores = probs[:, 1]
+        
+        # 🔍 Diagnóstico (opcional, remove depois)
+        # print(f"🔍 Score range: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
+        
+        return self._ensure_higher_is_anomaly(scores, invert=False)
+
+    def save(self, path):
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "model.pkl"), "wb") as f:
+            pickle.dump(self.model, f)
+
+    def load(self, path):
+        with open(os.path.join(path, "model.pkl"), "rb") as f:
+            self.model = pickle.load(f)
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/scripts/detectar.py
+================================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+import yaml
+import copy
+import json
+import argparse
+import time
+import psutil
+import pandas as pd
+import numpy as np
+from itertools import product
+from datetime import datetime
+import traceback
+import gc
+import shutil
+import pickle
+
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if root_path not in sys.path:
+    sys.path.insert(0, root_path)
+
+try:
+    from core.data.dataset_adapter import DatasetAdapter
+    from core.features.feature_processor import FeatureProcessor
+    from core.temporal_builder import TemporalBuilder
+    from core.models.model_factory import create as create_model
+    from core.trainer import Trainer
+    from scripts.evaluate_performance import run_external_evaluation
+except ImportError as e:
+    print(f"❌ Erro de Importação: {e}")
+    sys.exit(1)
+
+
+class ExperimentRunner:
+    def __init__(self, experiment_config_path):
+        actual_exp_path = self._resolve_path(experiment_config_path)
+        print(f"📖 Lendo configuração unificada: {actual_exp_path}")
+        with open(actual_exp_path, "r", encoding='utf-8') as f:
+            self.config = yaml.safe_load(f)
+
+        self.seeds = self.config.get("settings", {}).get("seeds", [42])
+
+        self.isolated_root = self.config.get("data", {}).get("isolated_tests_dir", None)
+        if self.isolated_root:
+            self.isolated_root = self._resolve_path(self.isolated_root)
+
+        self.sampling_mode = self.config.get("sampling", {}).get("mode", "full")
+        base_root = self.config.get("settings", {}).get("results_root", "results")
+        self.results_root = os.path.join(base_root, self.sampling_mode)
+
+        cache_root = self.config.get("settings", {}).get("cache_root", "data/GLOBAL_CACHE_DETECTOR")
+        self.cache_root = os.path.abspath(os.path.join(root_path, cache_root))
+        os.makedirs(self.cache_root, exist_ok=True)
+
+    def _resolve_path(self, path):
+        if not path: return path
+        search_paths = [
+            path,
+            os.path.join(root_path, path),
+            os.path.join("/content/drive/MyDrive/Project_Detector", path)
+        ]
+        for p in search_paths:
+            if p and os.path.exists(p): return os.path.abspath(p)
+        return path
+
+    def _apply_overrides(self, config, overrides):
+        if not overrides: return config
+        for key, val in overrides.items():
+            parts = key.split('.')
+            d = config
+            for part in parts[:-1]:
+                d = d.setdefault(part, {})
+            d[parts[-1]] = val
+        return config
+
+    def _validate_dataframe(self, df, name):
+        if df is None or df.empty:
+            print(f"⚠️ [WARNING] {name} está VAZIO!")
+            return False
+        if 'Time' not in df.columns:
+            print(f"⚠️ [WARNING] {name} não tem coluna 'Time'")
+            return False
+        return True
+    
+    def _evaluate_subset(self, trainer, temporal, test_df, output_dir, config, subset_name, verbose=False, precomputed_test=None):
+        os.makedirs(output_dir, exist_ok=True)
+        start_time = time.perf_counter()
+        
+        if precomputed_test is not None:
+            X_test, indices, users, y_test = precomputed_test
+        else:
+            X_test, indices, users, y_test = trainer._build_sequences(test_df, fit=False, return_labels=True)
+
+        if len(X_test) == 0:
+            raise RuntimeError(
+                f"Subset '{subset_name}' gerou 0 janelas. Não é métrica zero — é execução inválida."
+            )
+
+        scores = trainer._calculate_scores(X_test)
+        
+        global_fallback = trainer.global_threshold
+        thresholds_aplicados = np.array([trainer.user_thresholds.get(str(u), global_fallback) for u in users])
+        y_pred = (scores > thresholds_aplicados).astype(int)
+
+        np.save(os.path.join(output_dir, "scores.npy"), scores)
+        np.save(os.path.join(output_dir, "y_pred.npy"), y_pred)
+        np.save(os.path.join(output_dir, "indices.npy"), indices)
+        if y_test is not None:
+            np.save(os.path.join(output_dir, "y_true.npy"), y_test)
+
+        source_thresholds = os.path.join(trainer.output_dir, "user_thresholds.json")
+        if os.path.exists(source_thresholds):
+            shutil.copy(source_thresholds, os.path.join(output_dir, "user_thresholds.json"))
+
+        eval_config = copy.deepcopy(config)
+        eval_config["output_dir"] = output_dir
+        
+        try:
+            metrics = run_external_evaluation(
+                eval_config, test_df=test_df, scores=scores, indices=indices, verbose=verbose,
+                y_true=y_test, users=users, y_pred=y_pred
+            )
+        except Exception as e:
+            # Falha de avaliação NÃO é "desempenho ruim". É execução inválida.
+            raise RuntimeError(
+                f"Falha ao avaliar subset '{subset_name}' em {output_dir}: {e}"
+            ) from e
+        end_time = time.perf_counter()
+        try:
+            mem_peak_mb = psutil.Process().memory_info().peak_wset / (1024*1024) if sys.platform == 'win32' else psutil.Process().memory_info().rss / (1024*1024)
+        except:
+            mem_peak_mb = 0.0
+
+        return {**metrics, "elapsed_sec": end_time - start_time, "mem_peak_mb": mem_peak_mb}
+
+
+
+    def run(self):
+        datasets = self.config.get("datasets", [])
+        model_presets = self.config.get("model_presets", [])
+        hparam_grid = self.config.get("hyperparameter_grid", {})
+
+        grid_keys = list(hparam_grid.keys())
+        grid_values = list(hparam_grid.values())
+        grid_combinations = list(product(*grid_values)) if grid_values else [()]
+
+        total_runs = len(datasets) * len(model_presets) * max(1, len(grid_combinations)) * len(self.seeds)
+
+        print("\n" + "="*70)
+        print("🚀 RESUMO DA MARATONA DE EXPERIMENTOS")
+        print("="*70)
+        print(f" 🔹 Modo de Execução : {self.sampling_mode.upper()}")
+        print(f" 🔹 Diretório Base   : {self.results_root}")
+        print(f" 🔹 Cache Global     : {self.cache_root}")
+        print(f" 🔹 Datasets         : {len(datasets)}")
+        print(f" 🔹 Modelos (Presets): {len(model_presets)}")
+        print(f" 🔹 Combinações Grid : {max(1, len(grid_combinations))}")
+        print(f" 🔹 Sementes (Seeds) : {len(self.seeds)} {self.seeds}")
+        print(f" 🎯 TOTAL DE RUNS    : {total_runs}")
+        print("="*70 + "\n")
+
+        for seed in self.seeds:
+            print(f"\n{'#'*70}\n🌱 INICIANDO TREINO (SEED {seed})\n{'#'*70}\n")
+            
+            config_run_base = copy.deepcopy(self.config)
+            config_run_base.setdefault("training", {})["seed"] = seed
+
+            self.base_output_dir = os.path.join(self.results_root, f"run_seed{seed}")
+            os.makedirs(self.base_output_dir, exist_ok=True)
+            self.results_log = []
+            master_csv_path = os.path.join(self.base_output_dir, "master_results_table.csv")
+
+            # =========================================================
+            # 🔥 PLANEJAMENTO: Gerar lista de tarefas para esta seed
+            # =========================================================
+            tarefas = []
+            for ds in datasets:
+                ds_name = ds.get("name", "unknown_ds")
+                for mp in model_presets:
+                    mp_name = mp.get("name", "unknown_model")
+                    for combo in grid_combinations:
+                        current_hparams = dict(zip(grid_keys, combo))
+                        tarefas.append((ds_name, mp_name, current_hparams, combo))
+
+            tarefas_pendentes = []
+            if os.path.exists(master_csv_path):
+                try:
+                    existing_df = pd.read_csv(master_csv_path)
+                    existing_df = existing_df[existing_df["seed"] == seed]
+                    subset_cols = ["dataset", "model_preset", "training.threshold_mode", "model.sequence_length"]
+                    available_subset = [col for col in subset_cols if col in existing_df.columns]
+                    
+                    if available_subset:
+                        tarefas_df = pd.DataFrame([
+                            {
+                                "dataset": t[0],
+                                "model_preset": t[1],
+                                "training.threshold_mode": t[2].get("training.threshold_mode"),
+                                "model.sequence_length": t[2].get("model.sequence_length")
+                            }
+                            for t in tarefas
+                        ])
+                        
+                        merged = tarefas_df.merge(
+                            existing_df[available_subset],
+                            on=available_subset,
+                            how="left",
+                            indicator=True
+                        )
+                        tarefas_para_rodar = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"])
+                        
+                        for _, row in tarefas_para_rodar.iterrows():
+                            ds_name = row["dataset"]
+                            mp_name = row["model_preset"]
+                            current_hparams = {}
+                            for k in grid_keys:
+                                if k == "training.threshold_mode":
+                                    current_hparams[k] = row["training.threshold_mode"]
+                                elif k == "model.sequence_length":
+                                    current_hparams[k] = row["model.sequence_length"]
+                                else:
+                                    for t_orig in tarefas:
+                                        if t_orig[0] == ds_name and t_orig[1] == mp_name and t_orig[2].get("training.threshold_mode") == row["training.threshold_mode"] and t_orig[2].get("model.sequence_length") == row["model.sequence_length"]:
+                                            current_hparams = t_orig[2]
+                                            break
+                            combo_orig = None
+                            for t_orig in tarefas:
+                                if t_orig[0] == ds_name and t_orig[1] == mp_name and t_orig[2] == current_hparams:
+                                    combo_orig = t_orig[3]
+                                    break
+                            tarefas_pendentes.append((ds_name, mp_name, current_hparams, combo_orig))
+                        
+                        print(f"📊 Planejamento: {len(tarefas_pendentes)} tarefas pendentes de {len(tarefas)} totais.")
+                    else:
+                        tarefas_pendentes = tarefas
+                except Exception as e:
+                    print(f"⚠️ Erro ao ler CSV para planejamento: {e}. Executando todas as tarefas.")
+                    tarefas_pendentes = tarefas
+            else:
+                tarefas_pendentes = tarefas
+
+            if not tarefas_pendentes:
+                print(f"✅ Seed {seed}: todas as tarefas já foram executadas. Pulando.")
+                continue
+
+            # =========================================================
+            # PROCESSAMENTO: Executar apenas as tarefas pendentes
+            # =========================================================
+            for ds in datasets:
+                ds_name = ds.get("name", "unknown_ds")
+                config_ds = self._apply_overrides(copy.deepcopy(config_run_base), ds.get("overrides", {}))
+
+                tarefas_ds = [t for t in tarefas_pendentes if t[0] == ds_name]
+                if not tarefas_ds:
+                    continue
+
+                # =========================================================
+                # ETAPA 1: CACHE GLOBAL DE FEATURES (N1)
+                # =========================================================
+                split_strategy = config_ds.get("sampling", {}).get("split_strategy", "chronological")
+                cache_dir = os.path.join(self.cache_root, ds_name, f"seed_{seed}", split_strategy)
+                os.makedirs(cache_dir, exist_ok=True)
+                
+                cache_t_train = os.path.join(cache_dir, "t_train.parquet")
+                cache_t_val = os.path.join(cache_dir, "t_val.parquet")
+                cache_t_test = os.path.join(cache_dir, "t_test.parquet")
+                cache_meta = os.path.join(cache_dir, "processor_meta.pkl")
+                cache_iso = os.path.join(cache_dir, "isolated_datasets.pkl")
+
+                run_isolated = config_ds.get("settings", {}).get("run_isolated_eval", True)
+
+                if all(os.path.exists(p) for p in [cache_t_train, cache_t_val, cache_t_test, cache_meta]):
+                    print(f"\n📦 [CACHE GLOBAL] Carregando features pré-computadas para '{ds_name}' (Seed:{seed}, Split:{split_strategy.upper()})...")
+                    t_train = pd.read_parquet(cache_t_train)
+                    t_val = pd.read_parquet(cache_t_val)
+                    t_test = pd.read_parquet(cache_t_test)
+                    
+                    with open(cache_meta, "rb") as f:
+                        meta_cache = pickle.load(f)
+                        valid_features = meta_cache["valid_features"]
+                        processor = meta_cache["processor"]
+                        temporal = meta_cache["temporal"]
+
+                    isolated_datasets = {}
+                    if run_isolated and os.path.exists(cache_iso):
+                        with open(cache_iso, "rb") as f:
+                            isolated_datasets = pickle.load(f)
+                else:
+                    print(f"\n⚙️ [PROCESSAMENTO] Extraindo features do zero para '{ds_name}' e gravando no CACHE GLOBAL...")
+                    adapter = DatasetAdapter(config_ds)
+                    train_raw, val_raw, test_raw = adapter.load()
+
+                    if not self._validate_dataframe(train_raw, "train") or not self._validate_dataframe(test_raw, "test"):
+                        print(f"⚠️ Pulando dataset {ds_name}: Dataframes vazios.")
+                        continue
+
+                    processor = FeatureProcessor(config_ds)
+                    if hasattr(processor, 'fit'): processor.fit(train_raw)
+                    
+                    train_scaled = processor.transform(train_raw)
+                    val_scaled = processor.transform(val_raw)
+                    test_scaled = processor.transform(test_raw)
+                    
+                    valid_features = [c for c in processor.final_feature_names if c in train_scaled.columns and c in val_scaled.columns]
+
+                    isolated_datasets = {}
+                    test_size = config_ds.get("sampling", {}).get("test_size", 0)
+                    isolated_targets = config_ds.get("settings", {}).get("isolated_targets", [])
+                    
+                    if run_isolated and self.isolated_root and os.path.isdir(self.isolated_root):
+                        for item in os.listdir(self.isolated_root):
+                            if isolated_targets and item not in isolated_targets:
+                                continue
+                                
+                            item_path = os.path.join(self.isolated_root, item)
+                            if os.path.isdir(item_path) and item.startswith("test_"):
+                                test_file = os.path.join(item_path, f"{item}.jsonl")
+                                if os.path.exists(test_file):
+                                    iso_raw = adapter._load_resource(test_file, test_size)
+                                    iso_raw = adapter._normalize(iso_raw)
+                                    iso_raw = adapter._apply_auto_labels(iso_raw, test_file)
+                                    if iso_raw is not None and not iso_raw.empty:
+                                        isolated_datasets[item] = processor.transform(iso_raw)
+
+                    temporal = TemporalBuilder(config_ds)
+                    t_train = temporal.transform(train_scaled)
+                    t_val = temporal.transform(val_scaled)
+                    t_test = temporal.transform(test_scaled)
+                    
+                    t_train.to_parquet(cache_t_train)
+                    t_val.to_parquet(cache_t_val)
+                    t_test.to_parquet(cache_t_test)
+                    
+                    with open(cache_meta, "wb") as f:
+                        pickle.dump({
+                            "valid_features": valid_features,
+                            "processor": processor,
+                            "temporal": temporal
+                        }, f)
+                        
+                    if isolated_datasets:
+                        with open(cache_iso, "wb") as f:
+                            pickle.dump(isolated_datasets, f)
+                            
+                    del train_raw, val_raw, test_raw, train_scaled, val_scaled, test_scaled
+                    gc.collect()
+
+                # =========================================================
+                # 🔥 OTIMIZAÇÃO: N2 Hot Cache em memória
+                # =========================================================
+                n2_bundles = {}  # chave: (seq_len, is_sup) -> bundle
+
+                def get_n2_bundle(seq_len, is_sup):
+                    """Carrega ou cria o N2 uma única vez por (seq_len, is_sup)."""
+                    key = (seq_len, is_sup)
+                    if key in n2_bundles:
+                        return n2_bundles[key]
+
+                    cache_seq_dir = os.path.join(cache_dir, f"seq_{seq_len}_sup_{is_sup}")
+                    
+                    if os.path.exists(cache_seq_dir) and os.path.exists(os.path.join(cache_seq_dir, "meta.pkl")):
+                        print(f"\n   ⚡ [CACHE N2] Carregando matrizes de janelas (Seq={seq_len}, Sup={is_sup})...")
+                        X_train = np.load(os.path.join(cache_seq_dir, "X_train.npy"))
+                        y_train = np.load(os.path.join(cache_seq_dir, "y_train.npy"))
+                        X_val = np.load(os.path.join(cache_seq_dir, "X_val.npy"))
+                        val_users = np.load(os.path.join(cache_seq_dir, "val_users.npy"), allow_pickle=True)
+                        y_val = np.load(os.path.join(cache_seq_dir, "y_val.npy"))
+                        
+                        X_test = np.load(os.path.join(cache_seq_dir, "X_test.npy"))
+                        test_indices = np.load(os.path.join(cache_seq_dir, "test_indices.npy"))
+                        test_users = np.load(os.path.join(cache_seq_dir, "test_users.npy"), allow_pickle=True)
+                        y_test = np.load(os.path.join(cache_seq_dir, "y_test.npy"))
+                        
+                        with open(os.path.join(cache_seq_dir, "meta.pkl"), "rb") as f:
+                            seq_meta = pickle.load(f)
+                            scalers_dict = seq_meta["scalers"]
+                            feat_cols = seq_meta["feature_columns"]
+                    else:
+                        print(f"\n   ⚙️ [PROCESSAMENTO] Fatiando matrizes de janelas (Seq={seq_len}, Sup={is_sup}) e salvando no cache...")
+                        os.makedirs(cache_seq_dir, exist_ok=True)
+                        
+                        dummy_trainer = Trainer(config_final, None)  # será sobrescrito pelo config do modelo, mas só usamos _build_sequences
+                        target = config_ds.get("data", {}).get("target_col", "Is_Anomaly")
+                        if not is_sup:
+                            X_train, _, _, y_train = dummy_trainer._build_benign_training_sequences(
+                                t_train, feature_columns=valid_features
+                            )
+                            if y_train is not None:
+                                y_train = y_train[y_train == 0]
+                        else:
+                            X_train, _, _, y_train = dummy_trainer._build_sequences(
+                                t_train, fit=True, return_labels=True,
+                                feature_columns=valid_features
+                            )
+                        if y_train is None: y_train = np.zeros(len(X_train))
+                        
+                        X_val, _, val_users, y_val = dummy_trainer._build_sequences(t_val, fit=False, return_labels=True)
+                        if y_val is None: y_val = np.zeros(len(X_val))
+                        
+                        X_test, test_indices, test_users, y_test = dummy_trainer._build_sequences(t_test, fit=False, return_labels=True)
+                        if y_test is None: y_test = np.zeros(len(X_test))
+                        
+                        scalers_dict = dummy_trainer.scalers
+                        feat_cols = dummy_trainer.feature_columns
+                        
+                        np.save(os.path.join(cache_seq_dir, "X_train.npy"), X_train)
+                        np.save(os.path.join(cache_seq_dir, "y_train.npy"), y_train)
+                        np.save(os.path.join(cache_seq_dir, "X_val.npy"), X_val)
+                        np.save(os.path.join(cache_seq_dir, "val_users.npy"), val_users)
+                        np.save(os.path.join(cache_seq_dir, "y_val.npy"), y_val)
+                        np.save(os.path.join(cache_seq_dir, "X_test.npy"), X_test)
+                        np.save(os.path.join(cache_seq_dir, "test_indices.npy"), test_indices)
+                        np.save(os.path.join(cache_seq_dir, "test_users.npy"), test_users)
+                        np.save(os.path.join(cache_seq_dir, "y_test.npy"), y_test)
+                        
+                        with open(os.path.join(cache_seq_dir, "meta.pkl"), "wb") as f:
+                            pickle.dump({"scalers": scalers_dict, "feature_columns": feat_cols}, f)
+
+                    bundle = {
+                        "X_train": X_train, "y_train": y_train,
+                        "X_val": X_val, "val_users": val_users, "y_val": y_val,
+                        "X_test": X_test, "test_indices": test_indices, "test_users": test_users, "y_test": y_test,
+                        "scalers": scalers_dict, "feat_cols": feat_cols
+                    }
+                    n2_bundles[key] = bundle
+                    return bundle
+
+                # =========================================================
+                # LOOP DE MODELOS (APENAS OS PENDENTES)
+                # =========================================================
+                for mp in model_presets:
+                    mp_name = mp.get("name", "unknown_model")
+                    tarefas_mp = [t for t in tarefas_ds if t[1] == mp_name]
+                    if not tarefas_mp:
+                        continue
+                                              
+                    for combo in grid_combinations:
+                        # 🔥 CORREÇÃO: usa any() em vez de set()
+                        # pois combos podem conter listas (ex: hidden_layer_sizes=[32, 16])
+                        # e tuplas com listas não são hashable.
+                        if not any(t[3] == combo for t in tarefas_mp):
+                            continue           
+
+                        current_hparams = dict(zip(grid_keys, combo))
+                        
+                        config_final = self._apply_overrides(copy.deepcopy(config_ds), mp.get("overrides", {}))
+                        for k, v in current_hparams.items():
+                            config_final = self._apply_overrides(config_final, {k: v})
+
+                        seq_len = config_final.get("model", {}).get("sequence_length", 10)
+                        is_sup = config_final.get("training", {}).get("supervised", False)
+                        
+                        hparam_str = "_".join([str(v) for v in combo])
+                        modelo_str = f"{ds_name}_{mp_name}_{hparam_str}" if hparam_str else f"{ds_name}_{mp_name}"
+                        modelo_str = modelo_str.replace("/", "-")
+                        
+                        run_dir = os.path.join(self.base_output_dir, modelo_str)
+                        os.makedirs(run_dir, exist_ok=True)
+                        config_final["output_dir"] = run_dir
+
+                        print(f"--- 🏋️ Treinando: {modelo_str} ---")
+
+                        # 🔥 Obtém o bundle N2 do cache em memória
+                        bundle = get_n2_bundle(seq_len, is_sup)
+                        
+                        X_train = bundle["X_train"]
+                        y_train = bundle["y_train"]
+                        X_val = bundle["X_val"]
+                        val_users = bundle["val_users"]
+                        y_val = bundle["y_val"]
+                        X_test = bundle["X_test"]
+                        test_indices = bundle["test_indices"]
+                        test_users = bundle["test_users"]
+                        y_test = bundle["y_test"]
+                        scalers_dict = bundle["scalers"]
+                        feat_cols = bundle["feat_cols"]
+
+                        # =========================================================
+                        # TREINO E AVALIAÇÃO
+                        # =========================================================
+                        try:
+                            model = create_model(config_final)
+                            trainer = Trainer(config_final, model)
+                            
+                            trainer.scalers = scalers_dict
+                            trainer.feature_columns = feat_cols
+                            
+                            # 🔥 Lê a métrica de otimização do YAML (com fallback para f2)
+                            optim_metric = config_final.get("training", {}).get("optimization_metric", "f2")
+                            if optim_metric.lower() != "f2":
+                                raise ValueError(
+                                    f"optimization_metric='{optim_metric}' não suportada. "
+                                    "O Trainer atual implementa apenas F2. Ajuste o YAML."
+                                )
+                            
+                            results = trainer.run(t_train, t_val, t_test, feature_columns=valid_features)                        
+
+                            config_save_path = os.path.join(run_dir, "config_used.yaml")
+                            with open(config_save_path, "w", encoding="utf-8") as f:
+                                yaml.dump(config_final, f)
+                                
+                            meta_path = os.path.join(run_dir, "trainer_meta.pkl")
+                            if os.path.exists(meta_path):
+                                with open(meta_path, "rb") as f:
+                                    meta_trainer = pickle.load(f)
+                                meta_trainer['feature_processor'] = processor
+                                meta_trainer['temporal_builder'] = temporal
+                                with open(meta_path, "wb") as f:
+                                    pickle.dump(meta_trainer, f)
+
+                            run_mixed = config_final.get("settings", {}).get("run_mixed_eval", True)
+                            if run_mixed:
+                                mixed_output = os.path.join(run_dir, "eval_mixed")
+                                print(f"   🧪 Avaliando conjunto de teste misto...")
+                                
+                                precomp_test_bundle = (X_test, test_indices, test_users, y_test)
+                                mixed_metrics = self._evaluate_subset(
+                                    trainer, temporal, t_test, mixed_output, config_final, 
+                                    subset_name=ds_name, verbose=True, precomputed_test=precomp_test_bundle
+                                )
+                                
+                                log_entry = {"seed": seed, "dataset": ds_name, "model_preset": mp_name, **current_hparams, **results, **mixed_metrics}
+                                self.results_log.append(log_entry)
+                            else:
+                                print(f"   ⏭️ Avaliação mista ignorada.")
+
+                            if isolated_datasets and run_isolated:
+                                print(f"   🧪 Avaliando {len(isolated_datasets)} ataques isolados...")
+                                for iso_name, iso_scaled in isolated_datasets.items():
+                                    iso_df = temporal.transform(iso_scaled.copy())
+                                    iso_out = os.path.join(run_dir, f"eval_{iso_name}")
+                                    iso_metrics = self._evaluate_subset(trainer, temporal, iso_df, iso_out, config_final, subset_name=iso_name, verbose=True)
+                                    self.results_log.append({"seed": seed, "dataset": iso_name, "model_preset": mp_name, **current_hparams, **results, **iso_metrics})
+
+                            print(f"✅ Execução {modelo_str} finalizada e salva.\n")
+
+                        except Exception as e:
+                            print(f"❌ ERRO CRÍTICO no modelo {mp_name} (combo: {combo}, seed: {seed}):")
+                            traceback.print_exc()
+                            print(f"   ⚠️ Pulando este modelo e continuando com os próximos...\n")
+                            continue                            
+                            
+                        # =========================================================
+                        # SALVAMENTO COM APPEND + MERGE
+                        # =========================================================
+                        new_df = pd.DataFrame(self.results_log)
+
+                        if os.path.exists(master_csv_path) and not new_df.empty:
+                            try:
+                                existing_df = pd.read_csv(master_csv_path)
+
+                                # 🔥 Deduplicação dinâmica
+                                # Chave de identidade = colunas fixas + TODAS as colunas
+                                # de hiperparâmetros (n_estimators, max_depth, hidden_layer_sizes, etc.)
+                                # Excluímos métricas e metadados do critério de dedup.
+                                colunas_identidade = [
+                                    "seed", "dataset", "model_preset",
+                                    "training.threshold_mode", "model.sequence_length",
+                                ]
+
+                                metricas_e_meta = {
+                                    "val_score", "val_f2", "global_threshold", "best_percentile", "prevalence", "lift_pr",
+                                    "pr_auc", "roc_auc", "f1_score", "precision", "recall",
+                                    "tp", "fp", "tn", "fn", "elapsed_sec", "mem_peak_mb",
+                                    "source_file", "split_strategy", "supervised",
+                                }
+
+                                for col in new_df.columns:
+                                    if col not in colunas_identidade and col not in metricas_e_meta:
+                                        colunas_identidade.append(col)
+
+                                available_subset = [
+                                    col for col in colunas_identidade
+                                    if col in existing_df.columns and col in new_df.columns
+                                ]
+
+                                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+
+                                # 🔥 CORREÇÃO: converte listas/tuplas em strings antes do drop_duplicates,
+                                # pois listas não são hashable e quebram o drop_duplicates.
+                                for col in combined_df.columns:
+                                    if combined_df[col].apply(
+                                        lambda x: isinstance(x, (list, tuple))
+                                    ).any():
+                                        combined_df[col] = combined_df[col].apply(
+                                            lambda x: str(x)
+                                            if isinstance(x, (list, tuple))
+                                            else x
+                                        )
+
+                                if available_subset:
+                                    combined_df = combined_df.drop_duplicates(
+                                        subset=available_subset, keep="last"
+                                    )
+
+                                combined_df = combined_df.drop_duplicates()
+                                combined_df.to_csv(master_csv_path, index=False)
+                                print(f"💾 Resultados mesclados com sucesso (Total: {len(combined_df)} linhas).")
+
+                            except Exception as e:
+                                print(f"⚠️ Erro ao mesclar CSV existente: {e}. Salvando apenas os novos resultados.")
+                                new_df.to_csv(master_csv_path, index=False)
+                        else:
+                            new_df.to_csv(master_csv_path, index=False)    
+                            
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_config", type=str, required=True, help="Caminho para o arquivo YAML único.")
+    args = parser.parse_args()
+
+    runner = ExperimentRunner(args.exp_config)
+    runner.run()
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/scripts/evaluate_performance.py
+================================================================================
+import os
+import json
+import numpy as np
+import pandas as pd
+from sklearn.metrics import classification_report, precision_recall_curve, auc, roc_auc_score, confusion_matrix
+import matplotlib.pyplot as plt
+from numpy.lib.stride_tricks import sliding_window_view
+
+def run_external_evaluation(config, test_df=None, scores=None, indices=None, verbose=False, y_true=None, users=None, y_pred=None):
+    output_dir = config.get("output_dir", "./output")
+    target_col = config.get("data", {}).get("target_col", "Is_Anomaly")
+    sequence_length = config.get("model", {}).get("sequence_length", 10)
+    thresh_mode = config.get("training", {}).get("threshold_mode", "per_user")
+
+    # 1. Usa arrays da memória ou do disco
+    if scores is None or indices is None:
+        scores_file = os.path.join(output_dir, "scores.npy") if os.path.exists(os.path.join(output_dir, "scores.npy")) else os.path.join(output_dir, "test_scores.npy")
+        indices_file = os.path.join(output_dir, "indices.npy") if os.path.exists(os.path.join(output_dir, "indices.npy")) else os.path.join(output_dir, "test_indices.npy")
+        scores = np.load(scores_file)
+        indices = np.load(indices_file)
+
+    # 2. Alinhamento Estrito de Rótulos (sempre na mesma ordem das janelas)
+    if y_true is not None:
+        y_test = np.asarray(y_true).astype(int)
+    elif os.path.exists(os.path.join(output_dir, "y_true.npy")):
+        y_test = np.load(os.path.join(output_dir, "y_true.npy")).astype(int)
+    elif test_df is not None and not test_df.empty:
+        y_test_list = []
+        # ATENÇÃO: sort=False para respeitar a ordem estável de iteração do Trainer._build_sequences!
+        for user_id, group in test_df.groupby("UserID", sort=False):
+            if len(group) < sequence_length:
+                continue
+            windows_labels = sliding_window_view(group[target_col].values, window_shape=sequence_length)
+            y_test_list.append(np.max(windows_labels, axis=1))
+
+        y_test = np.concatenate(y_test_list) if y_test_list else np.array([])
+        y_test = np.nan_to_num(y_test, nan=0).astype(int)
+    else:
+        y_test = np.array([])
+
+    if len(y_test) != len(scores):
+        min_len = min(len(y_test), len(scores))
+        y_test, scores = y_test[:min_len], scores[:min_len]
+
+    # 3. Limiares e Predições
+    if y_pred is not None:
+        y_pred = np.asarray(y_pred).astype(int)
+        if len(y_pred) != len(scores):
+            y_pred = y_pred[:len(scores)]
+    else:
+        user_thresholds = {}
+        thresholds_path = os.path.join(output_dir, "user_thresholds.json")
+        if os.path.exists(thresholds_path):
+            with open(thresholds_path, "r", encoding="utf-8") as f:
+                user_thresholds = json.load(f)
+
+        global_fallback = user_thresholds.get("__GLOBAL_FALLBACK__", 0.5)
+
+        if users is not None:
+            test_users = [str(u) for u in users]
+        else:
+            user_mapping = test_df["UserID"].to_dict() if test_df is not None and "UserID" in test_df.columns else {}
+            test_users = [str(user_mapping.get(idx, "unknown")) for idx in indices]
+
+        sample_thresholds = np.array([
+            user_thresholds.get(u, global_fallback) if thresh_mode == "per_user" and u != "__GLOBAL_FALLBACK__" else global_fallback 
+            for u in test_users
+        ])
+        y_pred = (scores > sample_thresholds).astype(int)
+
+    # 4. Cálculo de Métricas
+    precision_curve, recall_curve, _ = precision_recall_curve(y_test, scores)
+    pr_auc = auc(recall_curve, precision_curve) if len(np.unique(y_test)) > 1 else 0.0
+    try:
+        roc_auc = roc_auc_score(y_test, scores)
+    except ValueError:
+        roc_auc = 0.5 
+
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel() if len(y_test) > 0 else (0, 0, 0, 0)
+    report_dict = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+    class_1 = report_dict.get("1", report_dict.get("1.0", report_dict.get("True", {})))
+
+    prevalence = float(np.mean(y_test)) if len(y_test) else 0.0
+    lift_pr = float(pr_auc / prevalence) if prevalence > 0 else 0.0
+    metrics_dict = {
+        "pr_auc": float(pr_auc), "prevalence": prevalence, "lift_pr": lift_pr,
+        "roc_auc": float(roc_auc),
+        "f1_score": float(class_1.get("f1-score", 0.0)),
+        "precision": float(class_1.get("precision", 0.0)),
+        "recall": float(class_1.get("recall", 0.0)),
+        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn)
+    }
+
+    with open(os.path.join(output_dir, "classification_report.json"), "w") as f:
+        json.dump(metrics_dict, f, indent=4)
+
+    # 5. Dashboard Elegante no Terminal (Somente se verbose=True)
+    if verbose:
+        total_events = len(test_df)
+        anom_events = int(test_df[target_col].sum())
+        prev_events = (anom_events / total_events * 100) if total_events > 0 else 0.0
+
+        total_windows = len(y_test)
+        anom_windows = int(np.sum(y_test))
+        prev_windows = (anom_windows / total_windows * 100) if total_windows > 0 else 0.0
+
+        print("\n" + "="*60)
+        print("📊 RESUMO DA AUDITORIA DE DETECÇÃO (DOUBLE CHECK)")
+        print("="*60)
+        print(f" 🔹 Eventos Totais (Brutos)      : {total_events}")
+        print(f" 🔹 Eventos Anômalos (Brutos)    : {anom_events} (Prevalência: {prev_events:.2f}%)")
+        print("-" * 60)
+        print(f" 🔹 Janelas Avaliadas (Seq={sequence_length})   : {total_windows}")
+        print(f" 🔹 Janelas Anômalas (Gabarito)  : {anom_windows} (Prevalência: {prev_windows:.2f}%)")
+        print(f" 🔹 Alertas Disparados           : {int(np.sum(y_pred))}")
+        print("-" * 60)
+        print(f" ✅ Verdadeiros Positivos (TP) : {int(tp)}")
+        print(f" ⚠️  Falsos Positivos (FP)     : {int(fp)}")
+        print(f" ❌ Falsos Negativos (FN)     : {int(fn)}")
+        print(f" 🛡️  Verdadeiros Negativos (TN) : {int(tn)}")
+        print("-" * 60)
+        print(f" 🎯 Precision (Precisão)      : {metrics_dict['precision']:.4f}")
+        print(f" 🎯 Recall (Sensibilidade)    : {metrics_dict['recall']:.4f}")
+        print(f" 🎯 F1-Score                  : {metrics_dict['f1_score']:.4f}")
+        print(f" 🎯 PR-AUC                    : {metrics_dict['pr_auc']:.4f}")
+        print(f" 🎯 Lift_PR                   : {metrics_dict['lift_pr']:.4f}x")
+        print(f" 🎯 ROC-AUC                   : {metrics_dict['roc_auc']:.4f}")
+        print("="*60 + "\n")
+        
+    return metrics_dict
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/scripts/inferir_usual.py
+================================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Inferência consolidada com integridade estrita de artefatos.
+
+- Falha alto se o meta não contiver feature_processor fitted.
+- Falha alto se user_thresholds.json não tiver __GLOBAL_FALLBACK__.
+- Falha alto em qualquer erro de carregamento de modelo (nunca usa
+  base_model sem pesos como fallback).
+- Caminho do projeto corrigido (2 níveis acima).
+- Métricas supervisionadas = NaN quando não há rótulos (não inventa).
+"""
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = current_dir
+for _ in range(4):
+    project_root = os.path.abspath(os.path.join(project_root, ".."))
+    if os.path.isdir(os.path.join(project_root, "core")):
+        break
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+import copy
+import pickle
+import json
+import numpy as np
+import pandas as pd
+import yaml
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import (
+    classification_report,
+    precision_recall_curve,
+    auc,
+    roc_auc_score,
+    confusion_matrix,
+)
+
+from core.data.dataset_adapter import DatasetAdapter
+from core.temporal_builder import TemporalBuilder
+from core.models.model_factory import create as create_model
+from core.trainer import Trainer
+
+
+def _load_model_from_dir(base_model, model_path):
+    """
+    Carrega pesos do modelo. Falha ALTO em erro (sem fallback silencioso).
+    Suporta .pkl (sklearn/wrapper), .keras e .pt (torch).
+    """
+    candidates = [
+        os.path.join(model_path, "model.pkl"),
+        os.path.join(model_path, "model.pt"),
+        os.path.join(model_path, "model.keras"),
+    ]
+    target_file = next((c for c in candidates if os.path.exists(c)), None)
+
+    if target_file is None:
+        if hasattr(base_model, "load"):
+            try:
+                base_model.load(model_path)
+                print(f"🤖 Modelo carregado via .load() nativo")
+                return base_model
+            except Exception as e:
+                raise RuntimeError(f"Falha em base_model.load({model_path}): {e}")
+        raise RuntimeError(f"Nenhum arquivo de pesos encontrado em: {model_path}")
+
+    print(f"🔗 Carregando pesos de: {target_file}")
+
+    if target_file.endswith('.pkl'):
+        with open(target_file, "rb") as pf:
+            loaded_obj = pickle.load(pf)
+        obj_module = type(loaded_obj).__module__
+        if obj_module.startswith(('sklearn', 'xgboost', 'lightgbm', 'catboost')):
+            base_model.model = loaded_obj
+            return base_model
+        elif hasattr(loaded_obj, "score") or hasattr(loaded_obj, "predict"):
+            return loaded_obj
+        elif isinstance(loaded_obj, dict) and hasattr(base_model, "load_state_dict"):
+            base_model.load_state_dict(loaded_obj)
+            return base_model
+        else:
+            base_model.model = loaded_obj
+            return base_model
+
+    elif target_file.endswith('.keras'):
+        try:
+            base_model.load(model_path)
+            return base_model
+        except Exception as e:
+            raise RuntimeError(f"Falha ao carregar modelo Keras em {target_file}: {e}")
+
+    else:  # .pt / .pth (torch)
+        try:
+            loaded_obj = torch.load(target_file, map_location=torch.device("cpu"), weights_only=False)
+        except Exception as e:
+            raise RuntimeError(f"Falha ao carregar torch model em {target_file}: {e}")
+        if isinstance(loaded_obj, torch.nn.Module):
+            return loaded_obj
+        elif isinstance(loaded_obj, dict) and hasattr(base_model, "load_state_dict"):
+            base_model.load_state_dict(loaded_obj)
+            return base_model
+        else:
+            raise RuntimeError(f"Formato torch não reconhecido em {target_file}: {type(loaded_obj)}")
+
+
+def rodar_inferencia(config_path, dataset_novo_path, model_dir_override=None):
+    print("=" * 70)
+    print("🔍 INFERÊNCIA DE ALTA FIDELIDADE E ZERO VAZAMENTO")
+    print("=" * 70)
+
+    if not os.path.exists(dataset_novo_path):
+        raise FileNotFoundError(f"❌ Arquivo não encontrado: {dataset_novo_path}")
+
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    if model_dir_override:
+        output_dir = model_dir_override
+    else:
+        output_dir = config.get("output_dir", "results")
+
+    model_path = os.path.join(output_dir, "saved_model")
+    meta_path = os.path.join(output_dir, "trainer_meta.pkl")
+    thresholds_path = os.path.join(output_dir, "user_thresholds.json")
+
+    if not os.path.exists(meta_path) and not model_dir_override:
+        print("⚠️ meta não encontrado no caminho direto. Buscando execução mais recente...")
+        pasta_raiz = config.get("settings", {}).get("results_root", "results")
+        encontrados = []
+        for root, dirs, files in os.walk(pasta_raiz):
+            if "trainer_meta.pkl" in files:
+                encontrados.append(root)
+        if encontrados:
+            encontrados.sort(reverse=True)
+            output_dir = encontrados[0]
+            model_path = os.path.join(output_dir, "saved_model")
+            meta_path = os.path.join(output_dir, "trainer_meta.pkl")
+            thresholds_path = os.path.join(output_dir, "user_thresholds.json")
+            print(f"✅ Selecionando o mais novo: {output_dir}")
+        else:
+            raise FileNotFoundError(f"❌ 'trainer_meta.pkl' não encontrado em {pasta_raiz}.")
+
+    print(f"📂 Diretório de artefatos: {output_dir}")
+
+    config_used_path = os.path.join(output_dir, "config_used.yaml")
+    if os.path.exists(config_used_path):
+        with open(config_used_path, "r") as f:
+            config = yaml.safe_load(f)
+        print("✅ config_used.yaml carregado.")
+
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+    scalers = meta['scalers']
+    feature_columns = meta['feature_columns']
+    print(f"✅ Pipeline de features: {len(feature_columns)} features.")
+
+    # ---------- Thresholds: exigir __GLOBAL_FALLBACK__ ----------
+    with open(thresholds_path, "r") as f:
+        user_thresholds = json.load(f)
+
+    if "__GLOBAL_FALLBACK__" not in user_thresholds:
+        raise RuntimeError(
+            f"user_thresholds.json sem __GLOBAL_FALLBACK__ em {output_dir}. "
+            "Artefato incompatível. Não inventando threshold."
+        )
+
+    # ---------- FeatureProcessor: obrigatório, estrito ----------
+    if 'feature_processor' not in meta:
+        raise RuntimeError(
+            "❌ Meta não contém 'feature_processor'. Retreine com versão atual "
+            "do pipeline (detectar.py injeta post-hoc; ou anexar via "
+            "trainer.feature_processor antes de run())."
+        )
+    processor = meta['feature_processor']
+    if not getattr(processor, "is_fitted", False):
+        raise RuntimeError("❌ FeatureProcessor do meta não está fitted. Artefato corrompido.")
+    processor.strict = True
+    print("✅ FeatureProcessor recuperado (fitted, strict=True).")
+
+    # ---------- Modelo: falha alto em erro ----------
+    base_model = create_model(config)
+    final_model = _load_model_from_dir(base_model, model_path)
+
+    trainer = Trainer(config, final_model)
+    trainer.scalers = scalers
+    trainer.feature_columns = feature_columns
+    trainer.user_thresholds = user_thresholds
+    trainer.global_threshold = user_thresholds["__GLOBAL_FALLBACK__"]
+
+    # ---------- Dataset ----------
+    config_infer = copy.deepcopy(config)
+    config_infer.setdefault("data", {})["test_path"] = dataset_novo_path
+    config_infer["data"]["train_path"] = ""
+    config_infer["data"]["val_path"] = ""
+    config_infer["data"]["dataset_path"] = ""
+    config_infer.setdefault("sampling", {})["mode"] = "full"
+
+    adapter = DatasetAdapter(config_infer)
+    _, _, test_raw = adapter.load()
+
+    if test_raw is None or test_raw.empty:
+        raise ValueError("❌ Dados extraídos vazios.")
+
+    test_scaled = processor.transform(test_raw)
+
+    if 'temporal_builder' in meta:
+        temporal = meta['temporal_builder']
+    else:
+        temporal = TemporalBuilder(config_infer)
+
+    test_df = temporal.transform(test_scaled)
+
+    X_test, indices_test, users_test, y_test = trainer._build_sequences(
+        test_df, fit=False, return_labels=True, feature_columns=feature_columns
+    )
+
+    if X_test is None or len(X_test) == 0:
+        print("⚠️ Dataset sem janelas temporais suficientes.")
+        return
+
+    if hasattr(final_model, "eval"):
+        final_model.eval()
+
+    scores = trainer._calculate_scores(X_test)
+
+    thresh_mode = config.get("training", {}).get("threshold_mode", "per_user")
+    thresholds_aplicados = np.array([
+        trainer.user_thresholds.get(str(u), trainer.global_threshold)
+        if thresh_mode == "per_user" and str(u) != "__GLOBAL_FALLBACK__"
+        else trainer.global_threshold
+        for u in users_test
+    ])
+
+    y_pred = (scores > thresholds_aplicados).astype(int)
+
+    # ---------- Métricas (NaN quando indefinidas) ----------
+    has_labels = y_test is not None and len(y_test) > 0
+    tn = fp = fn = tp = 0
+    pr_auc = float("nan")
+    roc_auc = float("nan")
+    class_1 = {"precision": float("nan"), "recall": float("nan"), "f1-score": float("nan")}
+
+    if has_labels and len(np.unique(y_test)) > 1:
+        precision_curve, recall_curve, _ = precision_recall_curve(y_test, scores)
+        pr_auc = auc(recall_curve, precision_curve)
+        try:
+            roc_auc = roc_auc_score(y_test, scores)
+        except ValueError:
+            roc_auc = float("nan")
+    elif has_labels:
+        print("⚠️ Apenas uma classe nos rótulos. PR-AUC e ROC-AUC indefinidos (NaN).")
+    else:
+        print("ℹ️ Dataset sem rótulos. Apenas scores e alertas serão emitidos.")
+
+    if has_labels:
+        tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel() if len(y_test) > 0 else (0, 0, 0, 0)
+        report_dict = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+        class_1 = report_dict.get("1", report_dict.get("1.0", report_dict.get("True", {})))
+
+        print("\n" + "=" * 60)
+        print("📊 RESULTADOS (Zero VAZAMENTO)")
+        print("=" * 60)
+        print(f" 🔹 Janelas: {len(y_test)} | Anomalias: {int(np.sum(y_test))} | Alertas: {int(np.sum(y_pred))}")
+        print(f" ✅ TP={int(tp)} ⚠️ FP={int(fp)} ❌ FN={int(fn)} 🛡️ TN={int(tn)}")
+        print(f" 🎯 Precision={class_1.get('precision', 0.0):.4f} Recall={class_1.get('recall', 0.0):.4f} F1={class_1.get('f1-score', 0.0):.4f}")
+        print(f" 🎯 PR-AUC={pr_auc:.4f} ROC-AUC={roc_auc:.4f}")
+        print("=" * 60 + "\n")
+
+    # ---------- CSV de eventos ----------
+    dataset_tag = os.path.basename(dataset_novo_path).replace(".jsonl", "")
+    out_csv = os.path.abspath(os.path.join(output_dir, f"inferencia_{dataset_tag}.csv"))
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+    df_resultado = test_df.loc[indices_test].copy().reset_index(drop=True)
+    df_resultado["anomaly_score"] = scores
+    df_resultado["is_alert"] = y_pred
+    df_resultado.to_csv(out_csv, index=False)
+    print(f"✅ CSV de eventos: {out_csv}")
+
+    # ---------- CSV de métricas ----------
+    metrics_csv = os.path.abspath(os.path.join(output_dir, f"metricas_{dataset_tag}.csv"))
+    pd.DataFrame([{
+        "model_dir": output_dir,
+        "dataset": dataset_tag,
+        "evaluation_mode": "official",
+        "n_windows": int(len(y_test)) if has_labels else int(len(scores)),
+        "n_anomalies_true": int(np.sum(y_test)) if has_labels else 0,
+        "n_alerts": int(np.sum(y_pred)),
+        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
+        "has_labels": int(has_labels),
+        "precision": float(class_1.get("precision", float("nan"))),
+        "recall": float(class_1.get("recall", float("nan"))),
+        "f1_score": float(class_1.get("f1-score", float("nan"))),
+        "pr_auc": float(pr_auc),
+        "roc_auc": float(roc_auc),
+    }]).to_csv(metrics_csv, index=False)
+    print(f"✅ CSV de métricas: {metrics_csv}")
+
+    # ---------- Dashboard (só com rótulos) ----------
+    if has_labels:
+        plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+        fig = plt.figure(figsize=(14, 10))
+        fig.suptitle('Avaliação de Inferência (UEBA)', fontsize=18, fontweight='bold', y=0.96)
+
+        ax1 = fig.add_subplot(221)
+        cm = np.array([[tn, fp], [fn, tp]])
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1, cbar=False, annot_kws={"size": 16, "weight": "bold"})
+        ax1.set_title('1. Matriz de Confusão', fontsize=14, fontweight='bold')
+        ax1.set_xticklabels(['Normal', 'Alarme'], fontsize=11)
+        ax1.set_yticklabels(['Normal', 'Anomalia'], fontsize=11, rotation=90)
+
+        ax2 = fig.add_subplot(222)
+        metric_vals = [
+            0.0 if np.isnan(pr_auc) else pr_auc,
+            0.0 if np.isnan(roc_auc) else roc_auc,
+        ]
+        sns.barplot(x=['PR-AUC', 'ROC-AUC'], y=metric_vals,
+                    hue=['PR-AUC', 'ROC-AUC'], palette=['#17becf', '#9467bd'], legend=False, ax=ax2)
+        ax2.set_title('2. AUCs', fontsize=14, fontweight='bold')
+        ax2.set_ylim(0, 1.1)
+        for container in ax2.containers:
+            ax2.bar_label(container, fmt='%.3f', padding=3, fontsize=12, fontweight='bold')
+
+        ax3 = fig.add_subplot(212)
+        base_vals = [
+            0.0 if np.isnan(class_1.get('precision', float('nan'))) else class_1.get('precision', 0.0),
+            0.0 if np.isnan(class_1.get('recall', float('nan'))) else class_1.get('recall', 0.0),
+            0.0 if np.isnan(class_1.get('f1-score', float('nan'))) else class_1.get('f1-score', 0.0),
+        ]
+        sns.barplot(x=['Precision', 'Recall', 'F1'], y=base_vals,
+                    hue=['Precision', 'Recall', 'F1'], palette=['#ff7f0e', '#2ca02c', '#1f77b4'], legend=False, ax=ax3)
+        ax3.set_title('3. Desempenho Operacional', fontsize=14, fontweight='bold')
+        ax3.set_ylim(0, 1.1)
+        for container in ax3.containers:
+            ax3.bar_label(container, fmt='%.3f', padding=3, fontsize=12, fontweight='bold')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.93])
+        dashboard_path = os.path.join(output_dir, f"dashboard_{dataset_tag}.png")
+        plt.savefig(dashboard_path, dpi=300)
+        plt.close()
+        print(f"✅ Dashboard: {dashboard_path}")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument("--model_dir", type=str, default=None)
+    args = parser.parse_args()
+    rodar_inferencia(args.config, args.data, args.model_dir)
+================================================================================
+# Arquivo: Det_Anomalias_UEBA/scripts/batch_inferir.py
+================================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Inferência em lote com dois modos bem separados:
+
+--mode official     (default)
+    Usa os thresholds salvos (user_thresholds.json) do treino.
+    Produz 1 linha por modelo por dataset. Esta é a métrica oficial.
+
+--mode sensitivity
+    Varre percentis de threshold sobre o próprio dataset alvo.
+    É uma ANÁLISE DE SENSIBILIDADE, NÃO uma avaliação confirmatória.
+    Produz N linhas por modelo (uma por percentil). Rotuladas como
+    evaluation_mode='sensitivity'.
+
+Falha alto em qualquer erro de carregamento de modelo.
+"""
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+import sys
+import glob
+import gc
+import pickle
+import yaml
+import json
+import numpy as np
+import pandas as pd
+import argparse
+import traceback
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = current_dir
+for _ in range(4):
+    project_root = os.path.abspath(os.path.join(project_root, ".."))
+    if os.path.isdir(os.path.join(project_root, "core")):
+        break
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+try:
+    import torch
+except ImportError:
+    torch = None
+from sklearn.metrics import precision_recall_curve, auc, roc_auc_score, confusion_matrix
+
+from core.data.dataset_adapter import DatasetAdapter
+from core.temporal_builder import TemporalBuilder
+from core.models.model_factory import create as create_model
+from core.trainer import Trainer
+
+
+def clear_memory():
+    gc.collect()
+    try:
+        import tensorflow as tf
+        tf.keras.backend.clear_session()
+    except ImportError:
+        pass
+
+
+def _load_model_from_dir(base_model, model_path):
+    """Falha alto em erro — nunca retorna base_model sem pesos."""
+    candidates = [
+        os.path.join(model_path, "model.pkl"),
+        os.path.join(model_path, "model.pt"),
+        os.path.join(model_path, "model.keras"),
+    ]
+    target_file = next((c for c in candidates if os.path.exists(c)), None)
+
+    if target_file is None:
+        if hasattr(base_model, "load"):
+            base_model.load(model_path)
+            return base_model
+        raise RuntimeError(f"Nenhum peso encontrado em: {model_path}")
+
+    if target_file.endswith('.pkl'):
+        with open(target_file, "rb") as pf:
+            loaded_obj = pickle.load(pf)
+        obj_module = type(loaded_obj).__module__
+        if obj_module.startswith(('sklearn', 'xgboost', 'lightgbm', 'catboost')):
+            base_model.model = loaded_obj
+            return base_model
+        elif hasattr(loaded_obj, "score") or hasattr(loaded_obj, "predict"):
+            return loaded_obj
+        elif isinstance(loaded_obj, dict) and hasattr(base_model, "load_state_dict"):
+            base_model.load_state_dict(loaded_obj)
+            return base_model
+        else:
+            base_model.model = loaded_obj
+            return base_model
+
+    elif target_file.endswith('.keras'):
+        try:
+            base_model.load(model_path)
+            return base_model
+        except Exception as e:
+            raise RuntimeError(f"Falha ao carregar Keras em {target_file}: {e}")
+
+    else:  # torch
+        try:
+            loaded_obj = torch.load(target_file, map_location=torch.device("cpu"), weights_only=False)
+        except Exception as e:
+            raise RuntimeError(f"Falha ao carregar torch model em {target_file}: {e}")
+        if isinstance(loaded_obj, torch.nn.Module):
+            return loaded_obj
+        elif isinstance(loaded_obj, dict) and hasattr(base_model, "load_state_dict"):
+            base_model.load_state_dict(loaded_obj)
+            return base_model
+        else:
+            raise RuntimeError(f"Formato torch não reconhecido em {target_file}")
+
+def _compute_metrics(y_test, y_pred, scores, eval_mode):
+    if y_test is None or len(y_test) == 0:
+        return {
+            "evaluation_mode": eval_mode, "has_labels": 0,
+            "pr_auc": float("nan"), "roc_auc": float("nan"),
+            "f1_score": float("nan"), "precision": float("nan"), "recall": float("nan"),
+            "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+        }
+
+    if len(np.unique(y_test)) > 1:
+        precision_curve, recall_curve, _ = precision_recall_curve(y_test, scores)
+        pr_auc = auc(recall_curve, precision_curve)
+        try:
+            roc_auc = roc_auc_score(y_test, scores)
+        except ValueError:
+            roc_auc = float("nan")
+    else:
+        pr_auc = float("nan")
+        roc_auc = float("nan")
+
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel() if len(y_test) > 0 else (0, 0, 0, 0)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else float("nan")
+
+    return {
+        "evaluation_mode": eval_mode, "has_labels": 1,
+        "pr_auc": pr_auc, "roc_auc": roc_auc,
+        "f1_score": f1, "precision": precision, "recall": recall,
+        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
+    }
+    
+'''def _compute_metrics(y_test, y_pred, scores, eval_mode):
+    if len(np.unique(y_test)) > 1:
+        precision_curve, recall_curve, _ = precision_recall_curve(y_test, scores)
+        pr_auc = auc(recall_curve, precision_curve)
+        try:
+            roc_auc = roc_auc_score(y_test, scores)
+        except ValueError:
+            roc_auc = float("nan")
+    else:
+        pr_auc = float("nan")
+        roc_auc = float("nan")
+
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel() if len(y_test) > 0 else (0, 0, 0, 0)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "evaluation_mode": eval_mode,
+        "pr_auc": pr_auc,
+        "roc_auc": roc_auc,
+        "f1_score": f1,
+        "precision": precision,
+        "recall": recall,
+        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
+    }
+'''
+
+def processar_modelo(model_dir, dataset_path, percentis_teste, mode):
+    print(f"\n[{model_dir}] (mode={mode})")
+
+    meta_path = os.path.join(model_dir, "trainer_meta.pkl")
+    config_path = os.path.join(model_dir, "config_used.yaml")
+    thresholds_path = os.path.join(model_dir, "user_thresholds.json")
+
+    if not os.path.exists(config_path):
+        print("  ⚠️ config_used.yaml ausente. Pulando.")
+        return []
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    with open(meta_path, "rb") as f:
+        meta = pickle.load(f)
+    scalers = meta['scalers']
+    feature_columns = meta['feature_columns']
+
+    if 'feature_processor' not in meta:
+        print("  ❌ Meta sem 'feature_processor'. Pulando.")
+        return []
+    processor = meta['feature_processor']
+    if not getattr(processor, "is_fitted", False):
+        print("  ❌ FeatureProcessor não fitted. Pulando.")
+        return []
+    processor.strict = True
+
+    # Configura para usar o dataset alvo
+    config.setdefault("data", {})
+    config["data"]["test_path"] = dataset_path
+    config["data"]["train_path"] = ""
+    config["data"]["val_path"] = ""
+    config["data"]["dataset_path"] = ""
+    config.setdefault("sampling", {})["mode"] = "full"
+
+    # Modelo (falha alto em erro)
+    base_model = create_model(config)
+    model_path = os.path.join(model_dir, "saved_model")
+    final_model = _load_model_from_dir(base_model, model_path)
+
+    if hasattr(final_model, "eval"):
+        final_model.eval()
+
+    trainer = Trainer(config, final_model)
+    trainer.scalers = scalers
+    trainer.feature_columns = feature_columns
+
+    # Dataset
+    adapter = DatasetAdapter(config)
+    _, _, test_raw = adapter.load()
+
+    if test_raw is None or test_raw.empty:
+        print("  ❌ Dataset vazio. Pulando.")
+        return []
+
+    test_scaled = processor.transform(test_raw)
+
+    if 'temporal_builder' in meta:
+        temporal = meta['temporal_builder']
+    else:
+        temporal = TemporalBuilder(config)
+
+    test_df = temporal.transform(test_scaled)
+
+    X_test, _, users_test, y_test = trainer._build_sequences(
+        test_df, fit=False, return_labels=True, feature_columns=feature_columns
+    )
+
+    if X_test is None or len(X_test) == 0:
+        print("  ⚠️ Sem janelas. Pulando.")
+        return []
+
+    scores = trainer._calculate_scores(X_test)
+    #if y_test is None:
+    #    y_test = np.zeros(len(scores))
+
+    model_type = config.get("model", {}).get("type", "")
+    folder_name = os.path.basename(model_dir)
+    if "randomforest" in folder_name.lower() or "random_forest" in model_type.lower():
+        model_preset = "RandomForest"
+    elif "mlp" in folder_name.lower() or "mlp" in model_type.lower():
+        model_preset = "MLP_Single"
+    else:
+        model_preset = config.get("model_presets", [{}])[0].get("name", "Unknown")
+
+    split_strategy = config.get("sampling", {}).get("split_strategy", "Unknown")
+    if split_strategy == "Unknown":
+        if "chronological" in folder_name.lower():
+            split_strategy = "chronological"
+        elif "random" in folder_name.lower():
+            split_strategy = "random"
+
+    thresh_mode = "per_user" if "per_user" in folder_name.lower() else ("global" if "global" in folder_name.lower() else config.get("training", {}).get("threshold_mode", "Unknown"))
+    seed = config.get("training", {}).get("seed", "Unknown")
+    dataset_tag = os.path.basename(dataset_path)
+
+    base_info = {
+        "source_dir": model_dir,
+        "model_preset": model_preset,
+        "threshold_mode": thresh_mode,
+        "split_strategy": split_strategy,
+        "seed": seed,
+        "dataset_tag": dataset_tag,
+    }
+
+    resultados = []
+
+    if mode == "official":
+        # Usa thresholds salvos (oficial, calibrado na validação)
+        if not os.path.exists(thresholds_path):
+            print("  ❌ user_thresholds.json ausente. Pulando (modo official exige thresholds salvos).")
+            return []
+        with open(thresholds_path, "r") as f:
+            user_thresholds = json.load(f)
+
+        thresh_mode = config.get("training", {}).get("threshold_mode", "per_user")
+        global_fb = user_thresholds.get("__GLOBAL_FALLBACK__", 0.5)
+        thresholds_aplicados = np.array([
+            user_thresholds.get(str(u), global_fb)
+            if thresh_mode == "per_user" and str(u) != "__GLOBAL_FALLBACK__"
+            else global_fb
+            for u in users_test
+        ])
+        y_pred = (scores > thresholds_aplicados).astype(int)
+
+        metrics = _compute_metrics(y_test, y_pred, scores, "official")
+        resultados.append({**base_info, "percentile": None, "threshold_value": None, **metrics})
+        print(f"  ✅ official: n_alerts={int(np.sum(y_pred))}")
+
+    elif mode == "sensitivity":
+        # Varredura de percentis (exploratória)
+        for p in percentis_teste:
+            threshold = np.percentile(scores, p)
+            y_pred = (scores > threshold).astype(int)
+            metrics = _compute_metrics(y_test, y_pred, scores, "sensitivity")
+            resultados.append({**base_info, "percentile": p, "threshold_value": threshold, **metrics})
+        print(f"  ✅ sensitivity: {len(percentis_teste)} percentis avaliados.")
+
+    else:
+        raise ValueError(f"mode inválido: {mode}")
+
+    return resultados
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=str, default="results")
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--output", type=str, default="batch_inference_results.csv")
+    parser.add_argument("--mode", type=str, default="official",
+                        choices=["official", "sensitivity"],
+                        help="official: thresholds salvos (métricas confirmatórias). "
+                             "sensitivity: varredura de percentis (exploratória).")
+    args = parser.parse_args()
+
+    print("="*70)
+    print(f"🚀 INFERÊNCIA EM LOTE | mode={args.mode.upper()}")
+    print("="*70)
+    print(f"📁 Raiz: {args.root}")
+    print(f"🎯 Dataset: {args.dataset}")
+
+    todos_resultados = []
+    pastas_processadas = set()
+    dataset_tag = os.path.basename(args.dataset)
+
+    if os.path.exists(args.output):
+        try:
+            df_existente = pd.read_csv(args.output)
+            if 'source_dir' in df_existente.columns and 'dataset_tag' in df_existente.columns:
+                # Resume: só pula modelos JÁ processados NESTE dataset NESTE modo
+                existing = df_existente[
+                    (df_existente['dataset_tag'] == dataset_tag)
+                    & (df_existente['evaluation_mode'] == args.mode)
+                ]
+                pastas_processadas = set(existing['source_dir'].unique())
+                todos_resultados = df_existente.to_dict('records')
+                print(f"🔄 Retomando: {len(pastas_processadas)} modelos já feitos neste dataset/modo.")
+        except Exception as e:
+            print(f"⚠️ Erro na retomada: {e}")
+
+    pattern = os.path.join(glob.escape(args.root), "**", "trainer_meta.pkl")
+    meta_files = glob.glob(pattern, recursive=True)
+
+    if not meta_files:
+        print(f"❌ Nenhum modelo em {args.root}.")
+        return
+
+    diretorios_modelos = sorted(set(os.path.dirname(f) for f in meta_files))
+    print(f"🔍 {len(diretorios_modelos)} modelos encontrados.")
+
+    percentis_teste = list(range(99, 89, -1))
+
+    for i, model_dir in enumerate(diretorios_modelos, 1):
+        print(f"\nProgresso: {i}/{len(diretorios_modelos)}")
+        if model_dir in pastas_processadas:
+            print("  ⏭️ Já processado (mesmo dataset e modo).")
+            continue
+
+        try:
+            resultados = processar_modelo(model_dir, args.dataset, percentis_teste, args.mode)
+            if resultados:
+                todos_resultados.extend(resultados)
+                pd.DataFrame(todos_resultados).to_csv(args.output, index=False)
+                print(f"  💾 CSV atualizado ({len(todos_resultados)} linhas).")
+        except Exception as e:
+            print(f"  ❌ Erro crítico em {model_dir}: {e}")
+            traceback.print_exc()
+            print("  ⏭️ Continuando com o próximo modelo.")
+
+        clear_memory()
+
+    if todos_resultados:
+        df_final = pd.DataFrame(todos_resultados)
+        df_final.to_csv(args.output, index=False)
+        print(f"\n✅ CONCLUÍDO — {len(df_final)} linhas em {args.output}")
+        print(f"   Filtre por evaluation_mode='official' para métricas confirmatórias.")
+    else:
+        print("\n⚠️ Nada foi gerado.")
+
+
+if __name__ == "__main__":
+    main()

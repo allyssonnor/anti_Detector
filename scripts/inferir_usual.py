@@ -15,6 +15,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = current_dir
 for _ in range(4):
@@ -30,7 +33,10 @@ import json
 import numpy as np
 import pandas as pd
 import yaml
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (

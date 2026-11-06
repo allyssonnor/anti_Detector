@@ -16,12 +16,14 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Dados pesados e Caches de Execução
-data/
+# Caches de Execução e Pastas Temporárias
+data/GLOBAL_CACHE_*
+data/*_cache*
 results/
 output/
 voltar para results depois/
-*.jsonl
+
+# Ignorar arquivos binários pesados de treino/cache
 *.parquet
 *.h5
 *.pkl

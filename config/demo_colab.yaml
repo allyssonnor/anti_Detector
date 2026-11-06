@@ -42,7 +42,7 @@ hyperparameter_grid:
   - 20
 
 data:
-  dataset_path: data/seed_1_sample.jsonl
+  dataset_path: data/ef_amplo.jsonl
   target_col: Is_Anomaly
   time_nan_strategy: nan
 
